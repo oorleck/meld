@@ -75,6 +75,14 @@ optional desktop one) and shows a personal-use notice. An installed copy can be 
   the same lag holds in every part of the overlap: unrelated clips reach z 10 by chance now and then, and one such
   false match would put songs on top of each other, so the window says "not confirmed" and the pair is not used. When sorting is over the group that is used is
   outlined. Hover a bar for its whole title. Close the window any time; **Show matching** in the footer brings it back.
+- **Strict search (optional).** By default a video is kept if its title (or channel name) has each word you typed, at
+  the start of a word, and does not name a different date; words such as "live" and "show" are not asked for, and a title
+  with no date is kept. Tick **Strict: the title must have every word I typed** and it is much fussier: every word must
+  be a whole word of the title itself (only connectors such as "the" and "at" are skipped, and the channel name does not
+  count), and the date, month and year you typed must be in the title too. A month can be said in words or in a date, so
+  "coldplay august wembley 2025" keeps "Wembley 16/08/2025" and "16 Aug 2025" and drops "12/06/2025", "September 2025" and
+  titles that give no month. You get fewer videos, each one that says outright it is what you asked for; if that is too
+  few, untick it. On the command line it is `--all-words` on `fetch` and `auto`.
 - **YouTube login (optional).** When YouTube answers "Sign in to confirm you're not a bot", downloads fail whatever
   the video. The **YouTube login** link at the bottom of the window lets Meld use the login already saved in one of
   your browsers (Firefox, Edge, Chrome or Brave, whichever are installed): sign in to YouTube in that browser, choose

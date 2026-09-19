@@ -237,6 +237,7 @@ def fetch(
     audio_only: bool = False,
     login_browser: str | None = None,
     remember: bool = False,
+    all_words: bool = False,
 ) -> list[dict]:
     """`choose(concerts)`, if given, is asked which one to use when the results turn out to be from several different
     concerts (see concerts.py): it returns one of them, or None for "use everything", or raises to abort.
@@ -247,17 +248,19 @@ def fetch(
     `remember` keeps what the search found in the project (see cache.py), and uses it again if the same search is made
     within a week (the same words and limits), so that going through it again does not ask YouTube again. Videos
     already downloaded are never downloaded twice, whether it is remembered or not.
+    `all_words` is the strict kind of matching (see relevance.py): every word typed, and the date, month and year, must
+    be in the title itself. Fewer videos, each surely the one asked for.
     Returns the videos wanted: the same list that is logged, each {id, title, uploader, duration, url}."""
     targets = [{"url": u, "title": None, "id": video_id(u), "uploader": None, "duration": None} for u in urls]
     memory = remember and not (choose or dry_run)  # asking which concert, or listing what would be dropped, is not repeated
     search_key = cache.key_of(
         "search", targets, queries, limit, min_duration, max_duration, max_clips, list(require), match_query, strict,
-        require_date, concert_only,
+        require_date, concert_only, all_words,
     )
     saved = cache.load(project.root, "search", search_key, SEARCH_MAX_AGE) if memory else None
 
     def run_search(q: str):
-        relevance = Relevance.from_query(match_query or q, require_date, concert_only) if strict else None
+        relevance = Relevance.from_query(match_query or q, require_date, concert_only, all_words) if strict else None
         return search(q, limit, min_duration, max_duration, require, relevance, log)
 
     if saved is not None:

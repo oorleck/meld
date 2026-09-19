@@ -4,6 +4,10 @@ Rules, applied to the video title (and channel name for words):
 - every meaningful word of the query must appear (prefix match, accent/case-insensitive);
 - if the query names a date (16 august 2022), a title that names a *different* date is rejected.
   Titles that name no date are kept; the date is often only in the description.
+
+`all_words` makes it strict: every word typed (bar connectors such as "the" and "at") must be a whole word of the title
+itself, not of the channel name, and the date, month and year typed must be in the title too. Fewer videos, but each one
+says outright that it is what was asked for.
 """
 from __future__ import annotations
 
@@ -26,12 +30,15 @@ _MONTHS = {
     12: "december dezember decembre dicembre diciembre dezembro dec dez dic",
 }
 _MONTH_NUM = {w: m for m, names in _MONTHS.items() for w in names.split()}
+# English months as typed in a query: a full name or an unmistakable abbreviation ("mar", "set" and "out" are also
+# months in other languages, but as words in a query they are far more likely to be just words)
+_ENGLISH_MONTHS = set(_MONTHS[m].split()[0] for m in _MONTHS) | {
+    "jan", "feb", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+}
 _MONTH_RE = "|".join(sorted(_MONTH_NUM, key=len, reverse=True))
 
-STOP = {
-    "the", "a", "an", "at", "in", "of", "on", "and", "live", "concert", "show", "tour", "video", "fan",
-    "hd", "full", "song", "de", "la", "el", "los", "en",
-}
+CONNECTORS = {"the", "a", "an", "at", "in", "of", "on", "and", "de", "la", "el", "los", "en"}  # never worth requiring
+STOP = CONNECTORS | {"live", "concert", "show", "tour", "video", "fan", "hd", "full", "song"}  # ... nor, usually, these
 
 _ISO = re.compile(r"(?<![\d./-])(\d{4})[./-](\d{1,2})[./-](\d{1,2})(?!\d)")
 _NUM = re.compile(r"(?<![\d./-])(\d{1,2})[./-](\d{1,2})(?:[./-](\d{4}|\d{2}))?(?![\d])")
@@ -75,8 +82,9 @@ def _ok(d: int, m: int) -> bool:
     return 1 <= d <= 31 and 1 <= m <= 12
 
 
-def find_dates(text: str) -> tuple[list[Date], str]:
-    """Dates mentioned in `text`, and the text with the date parts blanked out."""
+def find_dates(text: str, months: "set[int] | None" = None) -> tuple[list[Date], str]:
+    """Dates mentioned in `text`, and the text with the date parts blanked out. If `months` is given, the months that
+    are named without a day ("august 2025") are added to it, as numbers."""
     t = _norm(text)
     dates: list[Date] = []
 
@@ -105,6 +113,8 @@ def find_dates(text: str) -> tuple[list[Date], str]:
     sub(_NUM, num)
     sub(_DMY, lambda m: [(int(m[1]), _MONTH_NUM[m[2]], _year(m[3]))])
     sub(_MDY, lambda m: [(int(m[2]), _MONTH_NUM[m[1]], _year(m[3]))])
+    if months is not None:
+        months.update(_MONTH_NUM[m[1]] for m in _MONTH_YEAR.finditer(t))
     t = _MONTH_YEAR.sub(lambda m: blank(m), t)
     return dates, t
 
@@ -129,20 +139,41 @@ class Relevance:
     # yes for a bare year ("metallica 2003"), no for a full date, where the title often omits it.
     require_date: bool | None = None
     concert_only: bool = True  # drop interviews, commercials, rehearsals, covers, ... and titles with no live signal
+    months: set[int] = field(default_factory=set)  # months named without a day ("august 2025"); only checked when strict
+    all_words: bool = False  # strict: see the top of this file
 
     @classmethod
-    def from_query(cls, query: str, require_date: bool | None = None, concert_only: bool = True) -> "Relevance":
-        dates, rest = find_dates(query)
+    def from_query(
+        cls, query: str, require_date: bool | None = None, concert_only: bool = True, all_words: bool = False,
+    ) -> "Relevance":
+        months: set[int] = set()
+        dates, rest = find_dates(query, months)
+        skip = CONNECTORS if all_words else STOP  # strict: "live" and "show" were typed, so they are asked for
         words = [
             w for w in re.findall(r"[a-z0-9]+", rest)
-            if w not in STOP and not re.fullmatch(r"(19|20)\d\d", w)
+            if w not in skip and not re.fullmatch(r"(19|20)\d\d", w)
         ]
-        return cls(words, dates, find_years(query), require_date, concert_only)
+        if all_words:
+            # a month typed anywhere ("coldplay august wembley 2025") is a month the title must say, in words or in a
+            # date (16/08/2025), not a word it must contain
+            months |= {_MONTH_NUM[w] for w in words if w in _ENGLISH_MONTHS}
+            words = [w for w in words if w not in _ENGLISH_MONTHS]
+            if require_date is None:
+                require_date = True  # the date and year typed are part of what was asked for
+        return cls(words, dates, find_years(query), require_date, concert_only, months if all_words else set(), all_words)
 
     def check(self, title: str, uploader: str = "") -> str | None:
         """None if the result looks relevant, otherwise the reason it was rejected."""
-        hay = _norm(f"{title} {uploader}")
-        missing = [w for w in self.words if not re.search(r"(?<![a-z0-9])" + re.escape(w), hay)]
+        if self.all_words:  # whole words, of the title alone (a plural is the same word, whichever was typed)
+            hay = _norm(title)
+            stems = [w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w for w in self.words]
+            missing = [
+                w for w, stem in zip(self.words, stems)
+                if not re.search(r"(?<![a-z0-9])" + re.escape(stem) + r"(?:e?s)?(?![a-z0-9])", hay)
+            ]
+        else:
+            hay = _norm(f"{title} {uploader}")
+            missing = [w for w in self.words if not re.search(r"(?<![a-z0-9])" + re.escape(w), hay)]
         if missing:
             return "missing " + ", ".join(missing)
 
@@ -159,6 +190,12 @@ class Relevance:
                 return "different year"
             if not title_years and need:
                 return "no year in title"
+        if self.months and not self.dates:  # strict, and a month was typed without a day: the title must say that month
+            if title_dates:
+                if not any(m in self.months for cands in title_dates for _, m, _ in cands):
+                    return "different month"
+            elif not any(_MONTH_NUM.get(w) in self.months for w in re.findall(r"[a-z]+", _norm(title))):
+                return "no month in title"
         if self.concert_only:
             t = _norm(title)
             bad = _NEGATIVE.search(t)

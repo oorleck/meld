@@ -132,3 +132,76 @@ def test_any_video_switches_the_concert_filter_off():
     rel = Relevance.from_query(YEAR_QUERY, concert_only=False)
     assert rel.check("Metallica video interview 2003 (Part 1).flv") is None
     assert rel.check("Metallica interview 2008") == "different year"  # year/word rules still apply
+
+
+# ---- strict: every word typed, in the title itself
+
+STRICT_QUERY = "coldplay august wembley 2025"
+
+
+def strict(query=STRICT_QUERY, **kw):
+    return Relevance.from_query(query, all_words=True, **kw)
+
+
+def test_strict_reads_a_month_typed_anywhere_as_a_month_and_not_as_a_word():
+    rel = strict()
+    assert rel.words == ["coldplay", "wembley"] and rel.months == {8} and rel.years == {2025}
+
+
+@pytest.mark.parametrize("title", [
+    "Coldplay - Yellow - Live at Wembley Stadium 16/08/2025",  # the month is in the date
+    "Coldplay Wembley live 16 Aug 2025",
+    "Coldplay Wembley live August 2025 - Fix You",
+    "COLDPLAY WEMBLEY live 2025-08-16",
+])
+def test_strict_keeps_a_title_that_says_the_month_and_year(title):
+    assert strict().check(title) is None
+
+
+@pytest.mark.parametrize("title, reason", [
+    ("Coldplay Wembley live 2025 Fix You", "no month in title"),
+    ("Coldplay Wembley Stadium live 12/06/2025 Yellow", "different month"),
+    ("Coldplay Wembley live 20 September 2025 Yellow", "different month"),
+    ("Coldplay Wembley live 16 Aug 2024", "different year"),
+    ("Coldplay Wembley live August", "no year in title"),
+])
+def test_strict_drops_a_title_that_does_not_say_the_month_and_year(title, reason):
+    assert strict().check(title) == reason
+
+
+def test_strict_asks_for_the_title_to_have_every_word_not_the_channel_or_the_start_of_a_word():
+    rel = strict()
+    assert rel.check("Live at Wembley 16/08/2025 - Sky Full of Stars", uploader="Coldplay") == "missing coldplay"
+    assert rel.check("Coldplay Wembleystadium live August 2025") == "missing wembley"  # a word, not the start of one
+    assert Relevance.from_query(STRICT_QUERY).check("Coldplay Wembleystadium live August 2025") is None  # as it was
+    assert rel.check("Coldplay at Wembley live August 2025") is None
+    for typed, in_title in (("songs", "song"), ("song", "songs")):  # a plural is the same word, whichever way round
+        rel_plural = Relevance.from_query(f"coldplay wembley {typed} 2025", all_words=True)
+        assert rel_plural.check(f"Coldplay Wembley {in_title} live 2025") is None
+    assert Relevance.from_query("coldplay wembley boss 2025", all_words=True).check("Coldplay Wembley bos live 2025") is not None
+
+
+def test_strict_asks_for_the_words_that_are_usually_left_out_but_not_for_connectors():
+    rel = Relevance.from_query("coldplay at the wembley live 2025", all_words=True)
+    assert rel.words == ["coldplay", "wembley", "live"]  # "at" and "the" are never asked for
+    assert rel.check("Coldplay Wembley 2025 Fix You concert") == "missing live"
+    assert Relevance.from_query("coldplay at the wembley live 2025").words == ["coldplay", "wembley"]  # not so by default
+
+
+def test_strict_asks_for_the_date_in_the_title_unless_told_otherwise():
+    assert Relevance.from_query(QUERY).check("Coldplay Yellow Wembley Stadium") is None  # by default: kept
+    assert strict(QUERY).check("Coldplay Yellow Wembley Stadium live") == "no date in title"
+    assert strict(QUERY).check("Coldplay Yellow Wembley Stadium live 16/08/2022") is None
+    assert strict(QUERY, require_date=False).check("Coldplay Yellow Wembley Stadium live") is None  # asked for explicitly
+
+
+def test_strict_still_applies_the_rules_that_are_not_about_words():
+    rel = strict()
+    assert rel.check("Coldplay Wembley 16/08/2025 interview") == "not a concert (interview)"
+    assert rel.check("Coldplay Wembley fix you 2025 august") == "no live/concert signal"  # nothing says it is a concert
+    assert rel.check("Coldplay Wembley 16/08/2025") is None  # ... but a dated performance does
+
+
+def test_the_default_is_not_strict():
+    rel = Relevance.from_query(STRICT_QUERY)
+    assert rel.all_words is False and rel.months == set()

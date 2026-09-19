@@ -72,6 +72,7 @@ class Settings:
     quality: int = 720
     keep_files: bool = False  # keep the downloaded videos and working files after a successful run
     login: str | None = None  # a browser (a key of LOGIN_BROWSERS) whose YouTube login the downloads use
+    strict: bool = False  # only videos whose title has every word typed, and the date (see relevance.py)
 
     @property
     def project_dir(self) -> Path:
@@ -156,14 +157,15 @@ def run_pipeline(s: Settings, log=print, stage=lambda i, name: None, choose_grou
     found = fetch(
         preview, [], expand_queries(s.query),
         limit=max(wanted, 30), min_duration=20, max_duration=900, max_clips=wanted, match_query=s.query,
-        log=log, audio_only=True, login_browser=s.login, remember=True,
+        log=log, audio_only=True, login_browser=s.login, remember=True, all_words=s.strict,
     )
     # only what this search found: previews left from a bigger search before are not part of it
     ids = {t["id"] for t in found if t.get("id")} if found else None
     previewed = len([f for f in preview.clip_files() if ids is None or f.stem in ids])
     if not previewed:
         raise UserError(
-            "I couldn't find any matching videos. Try fewer words, for example just the band and the year."
+            "I couldn't find any matching videos. Try fewer words, for example just the band and the year"
+            + (", or turn off Strict search." if s.strict else ".")
         )
 
     def pick_group(groups) -> int | None:
@@ -327,7 +329,7 @@ def save_settings(s: Settings) -> None:
         _settings_path().write_text(
             json.dumps({
                 "folder": str(s.folder), "clips": s.clips, "quality": s.quality, "query": s.query,
-                "keep": s.keep_files, "login": s.login,
+                "keep": s.keep_files, "login": s.login, "strict": s.strict,
             }),
             encoding="utf-8",
         )
@@ -557,6 +559,7 @@ def main(hook=None) -> None:
     clips_var = tk.IntVar(value=saved.get("clips", 100))
     quality_var = tk.IntVar(value=saved.get("quality", 720))
     keep_var = tk.BooleanVar(value=bool(saved.get("keep", False)))
+    strict_var = tk.BooleanVar(value=bool(saved.get("strict", False)))
     login_var = tk.StringVar(value=saved.get("login") or "")  # a browser whose YouTube login to use, or ""
     folder_var =tk.StringVar(value=saved.get("folder", str(default_folder())))
     folder_shown = tk.StringVar(value=shorten_path(folder_var.get()))
@@ -629,6 +632,19 @@ def main(hook=None) -> None:
             ttk.Radiobutton(toggles, text=text, value=n, variable=var, style="Choice.Toolbutton", cursor="hand2").pack(
                 side="left", padx=(0, px(8))
             )
+
+    # Strict: only videos whose title has every word typed (and the date, month and year). Fewer, but surely the right ones.
+    ttk.Label(opts, text="SEARCH", style="CardSection.TLabel", width=17).grid(
+        row=2, column=0, sticky="w", padx=(0, px(12)), pady=(px(10), 0)
+    )
+    strict_btn = ttk.Checkbutton(opts, style="Choice.Toolbutton", variable=strict_var, cursor="hand2")
+    strict_btn.grid(row=2, column=1, sticky="w", pady=(px(10), 0))
+
+    def show_strict(*_) -> None:
+        strict_btn.configure(text=("✓ " if strict_var.get() else "") + "Strict: the title must have every word I typed")
+
+    strict_var.trace_add("write", show_strict)
+    show_strict()
 
     where = ttk.Frame(frm)
     where.grid(row=6, column=0, sticky="ew", pady=(px(12), 0))
@@ -857,6 +873,7 @@ def main(hook=None) -> None:
         cancel_btn.configure(state="normal" if running else "disabled")
         entry.configure(state="disabled" if running else "normal")
         keep_btn.configure(state="disabled" if running else "normal")
+        strict_btn.configure(state="disabled" if running else "normal")
         saved_btn.configure(state="disabled" if running else "normal")
         login_btn.configure(state="disabled" if running else "normal")
 
@@ -919,7 +936,10 @@ def main(hook=None) -> None:
             messagebox.showinfo(APP_NAME, "Please type which concert to look for, for example:  Metallica 2003")
             entry.focus_set()
             return
-        s = Settings(query, Path(folder_var.get()), clips_var.get(), quality_var.get(), keep_var.get(), login_var.get() or None)
+        s = Settings(
+            query, Path(folder_var.get()), clips_var.get(), quality_var.get(), keep_var.get(), login_var.get() or None,
+            strict_var.get(),
+        )
         try:
             s.folder.mkdir(parents=True, exist_ok=True)
             free = shutil.disk_usage(s.folder).free / 1024**3
@@ -1088,7 +1108,7 @@ def main(hook=None) -> None:
                 login_btn.configure(text=login_label())
                 save_settings(Settings(
                     query_var.get().strip(), Path(folder_var.get()), clips_var.get(), quality_var.get(), keep_var.get(),
-                    login_var.get() or None,
+                    login_var.get() or None, strict_var.get(),
                 ))
             try:
                 win.grab_release()
@@ -1236,7 +1256,7 @@ def main(hook=None) -> None:
         widgets = {
             "query": query_var, "folder": folder_var, "clips": clips_var, "quality": quality_var, "login": login_var, "match_btn": match_btn, "match_view": view,
             "start": start_btn, "step": step_var, "detail": detail_var, "result": result_label, "play": play_btn,
-            "queue": q, "keep": keep_var,
+            "queue": q, "keep": keep_var, "strict": strict_var,
         }
         root.after(300, hook, root, widgets)
     entry.focus_set()

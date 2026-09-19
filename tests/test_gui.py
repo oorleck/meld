@@ -562,3 +562,35 @@ def test_a_long_log_is_cut_to_its_end_from_a_whole_line(tmp_path):
     short.write_text("a\nb\n", encoding="utf-8")
     gui.trim_log(short)
     assert short.read_text(encoding="utf-8") == "a\nb\n"
+
+
+# ---- a stricter search
+
+
+def test_settings_remember_strict_and_it_is_off_by_default(tmp_path, monkeypatch):
+    monkeypatch.setattr(gui, "_settings_path", lambda: tmp_path / "settings.json")
+    assert Settings("x", tmp_path).strict is False
+    assert gui.load_saved().get("strict") is None
+    gui.save_settings(Settings("x", tmp_path, strict=True))
+    assert gui.load_saved()["strict"] is True
+    gui.save_settings(Settings("x", tmp_path))
+    assert gui.load_saved()["strict"] is False
+
+
+def test_the_strict_choice_reaches_the_search(tmp_path, monkeypatch):
+    yt = FakeYouTube(tmp_path / "youtube")
+    _one_concert(yt)
+    monkeypatch.setattr(gui, "fetch", yt)
+    run_pipeline(Settings("test show 2024", tmp_path / "loose", clips=20), log=lambda *_: None)
+    run_pipeline(Settings("test show 2024", tmp_path / "strict", clips=20, strict=True), log=lambda *_: None)
+    previews = [k for k in yt.kwargs if k.get("audio_only")]
+    assert [k["all_words"] for k in previews] == [False, True]
+
+
+def test_when_strict_finds_nothing_the_message_says_what_to_turn_off(tmp_path, monkeypatch):
+    monkeypatch.setattr(gui, "fetch", lambda *a, **k: [])
+    with pytest.raises(UserError, match="couldn't find") as loose:
+        run_pipeline(Settings("nothing here", tmp_path / "a"), log=lambda *_: None)
+    with pytest.raises(UserError, match="turn off Strict search") as strict:
+        run_pipeline(Settings("nothing here", tmp_path / "b", strict=True), log=lambda *_: None)
+    assert "Strict" not in str(loose.value) and "Strict" in str(strict.value)

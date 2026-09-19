@@ -55,6 +55,12 @@ def _add_fetch_opts(p: argparse.ArgumentParser, limit=250, max_duration=3600, ma
         help="turn off strict matching (by default every query word must be in the title/channel, "
              "and titles naming a different date are dropped)",
     )
+    p.add_argument(
+        "--all-words", action="store_true",
+        help="stricter matching: every word of the query (also 'live', 'show' ...), and the date, month and year, must "
+             "be in the video's title itself, as whole words; the channel name does not count. Fewer videos, each "
+             "surely the one asked for",
+    )
     p.add_argument("--dry-run", action="store_true", help="list candidates without downloading")
 
 
@@ -177,7 +183,7 @@ def main(argv: list[str] | None = None) -> None:
             args.max_height, args.dry_run, args.require, args.max_clips, args.workers,
             not args.loose, args.query if args.cmd == "auto" else None,
             True if args.require_date else (False if args.allow_undated else None), not args.any_video, _log,
-            login_browser=args.cookies_from_browser,
+            login_browser=args.cookies_from_browser, all_words=args.all_words,
         )
         if args.cmd == "fetch" or args.dry_run:
             return

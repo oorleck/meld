@@ -37,3 +37,13 @@ def test_many_variations_are_not_all_searched_at_once(tmp_path, monkeypatch):
     assert len(queries) > SEARCH_WORKERS
     fetch_mod.fetch(Project(tmp_path), [], queries, match_query="band 2024", log=lambda *_: None)
     assert sizes == [SEARCH_WORKERS]  # a few at a time, not one thread per variation
+
+
+def test_the_command_line_can_ask_for_every_word(tmp_path, monkeypatch):
+    from meld import cli
+
+    seen = []
+    monkeypatch.setattr(fetch_mod, "fetch", lambda *a, **k: seen.append(k))
+    cli.main(["fetch", "-p", str(tmp_path), "-s", "band 2024"])
+    cli.main(["fetch", "-p", str(tmp_path), "-s", "band 2024", "--all-words"])
+    assert [k["all_words"] for k in seen] == [False, True]

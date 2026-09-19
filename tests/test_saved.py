@@ -330,3 +330,25 @@ def test_a_search_is_only_saved_when_asked_to(tmp_path, monkeypatch):
     _fetch(project, remember=False)
     _fetch(project, remember=False)
     assert state["searches"] == 2 and not (project.root / cache.SAVED).exists()
+
+
+def test_a_stricter_search_is_not_taken_from_a_looser_one_that_was_saved(tmp_path, monkeypatch):
+    state = _fake_youtube(monkeypatch)
+    project = Project(tmp_path)
+    _fetch(project)
+    _fetch(project, all_words=True)  # not the same question: it must be asked again
+    assert state["searches"] == 2
+    _fetch(project, all_words=True)  # but the same one again is remembered
+    assert state["searches"] == 2
+
+
+def test_the_strict_kind_of_matching_reaches_the_filter(tmp_path, monkeypatch):
+    from meld import fetch as fetch_mod
+
+    seen = []
+    monkeypatch.setattr(fetch_mod, "search", lambda q, limit, lo, hi, require, relevance, log: (seen.append(relevance), ([], []))[1])
+    for strict in (False, True):
+        fetch_mod.fetch(Project(tmp_path / str(strict)), [], ["coldplay august wembley 2025"], match_query="coldplay august wembley 2025",
+                        log=lambda *_: None, all_words=strict)
+    assert [r.all_words for r in seen] == [False, True]
+    assert seen[1].months == {8} and seen[1].words == ["coldplay", "wembley"]
