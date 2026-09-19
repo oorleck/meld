@@ -288,7 +288,7 @@ class MatchCanvas(tk.Canvas):
                     ax, ay, mx, my, bx, by, smooth=True, width=2 * self.k, fill=colour, arrow="last",
                     dash=(5, 4) if link.z is None else (), dashoffset=int(time.monotonic() * 20) % 9 if link.z is None else 0,
                 )
-                text = "comparing..." if link.z is None else f"z {link.z:.0f}" + ("  match" if link.ok else "")
+                text = "comparing..." if link.z is None else f"z {link.z:.0f}" + ("  match" if link.ok else "  not confirmed" if link.doubted else "")
                 tid = self.create_text(mx, my - 8 * self.k, text=text, fill=colour, font=self.f_lane)
                 x0, y0, x1, y1 = self.bbox(tid)
                 self._round(x0 - 4, y0 - 1, x1 + 4, y1 + 1, 4 * self.k, fill=t.bg, outline="")

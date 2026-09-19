@@ -209,3 +209,49 @@ def test_the_earliest_clip_that_is_left_starts_at_zero(tmp_path):
     write_wav(project.clips_dir / "late.wav", x, SR)
     tl = line_up_downloads(preview, project, [ClipEntry("late.wav", 55.0, 60.0, False, 0, 0)], log=lambda *_: None)
     assert [c.offset for c in tl.clips] == [0.0]  # the group's first clip may have been left out: times start again at 0
+
+
+# ---- a score in the middle is not enough on its own
+
+
+def _scores(monkeypatch, change):
+    """Make `correlate` give scores `change(lag, z)` instead of its own: the sound is real, only the score is not."""
+    from meld import sync as sync_mod
+
+    real = sync_mod.correlate
+
+    def altered(a, b, fs, band=(150.0, 5000.0), min_overlap=5.0):
+        lag, z = real(a, b, fs, band, min_overlap)
+        return change(lag, z)
+
+    monkeypatch.setattr(sync_mod, "correlate", altered)
+
+
+def test_unrelated_clips_that_score_in_the_middle_by_chance_are_not_joined(tmp_path, monkeypatch):
+    # what happens in a real run: among hundreds of pairs of unrelated clips a few reach the score a match needs, and each
+    # would put one song (or one night) on top of another
+    _scores(monkeypatch, lambda lag, z: (lag, 12.0 if z < 10 else z))
+    tl = sync(project_with(tmp_path, TWO_CONCERTS))
+    assert names(tl.clips) == {"a1": 0.0, "a2": 40.0, "a3": 80.0, "a4": 120.0}
+    assert [names(g) for g in tl.others] == [{"b1": 0.0, "b2": 30.0, "b3": 70.0}]  # still two groups, not one heap
+
+
+def test_a_real_match_that_scores_in_the_middle_still_joins(tmp_path, monkeypatch):
+    _scores(monkeypatch, lambda lag, z: (lag, min(z, 15.0)))  # a noisy recording: real, but never over 15
+    tl = sync(project_with(tmp_path, TWO_CONCERTS))
+    assert names(tl.clips) == {"a1": 0.0, "a2": 40.0, "a3": 80.0, "a4": 120.0}
+    assert [names(g) for g in tl.others] == [{"b1": 0.0, "b2": 30.0, "b3": 70.0}]
+
+
+def test_the_view_is_told_when_a_score_was_not_believed(tmp_path, monkeypatch):
+    from meld.matchview import layout, make_labels
+
+    _scores(monkeypatch, lambda lag, z: (lag, 12.0 if z < 10 else z))
+    states, lines = [], []
+    sync_project(project_with(tmp_path, TWO_CONCERTS), log=lines.append, on_state=states.append)
+    doubted = [s for s in states if s.doubted]
+    assert doubted and all(s.compare[2] == 12.0 for s in doubted)
+    assert any("not a match" in line for line in lines)
+    link = layout(doubted[0], make_labels(list(doubted[0].durations), {}), {}, 800, 400).link
+    assert link.doubted and not link.ok  # drawn as "not confirmed", not as a match
+    assert not any(s.doubted for s in states if s.compare and s.compare[2] is not None and s.compare[2] >= 25)

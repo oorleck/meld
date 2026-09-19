@@ -26,6 +26,7 @@ class MatchState:
     phase: int = 1  # 1: the first sweep, 2: the second look at clips that matched nothing
     compared: int = 0  # comparisons made so far
     min_z: float = 10.0  # the score a match needs
+    doubted: bool = False  # the pair being compared scored enough, but did not hold through the overlap: not a match
     chosen: frozenset[str] | None = None  # the clips of the group that is used, once sorting is over
     finished: bool = False
 
@@ -99,6 +100,7 @@ class Link:
     dst: str
     z: float | None
     ok: bool  # whether the score is enough to match
+    doubted: bool = False  # the score is enough, but the match did not hold through the overlap
 
 
 @dataclass
@@ -332,7 +334,8 @@ def layout(
     # --- the comparison going on
     if state.compare:
         src, dst, z = state.compare
-        out.link = Link(src, dst, z, z is not None and z >= state.min_z)
+        enough = z is not None and z >= state.min_z
+        out.link = Link(src, dst, z, enough and not state.doubted, enough and state.doubted)
     return out
 
 

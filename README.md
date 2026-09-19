@@ -59,7 +59,9 @@ optional desktop one) and shows a personal-use notice. An installed copy can be 
   words most titles share, such as the band and the year). All timelines share one time scale, so a bigger group
   looks bigger; videos playing at the same time are stacked. The video being sorted waits in a tray at the bottom
   and a dotted line runs from it to the one it is being compared with, with the score it got; a match slides the bar
-  into its group, and a video that links two groups makes them one. When sorting is over the group that is used is
+  into its group, and a video that links two groups makes them one. A middling score (z 10 to 25) is only believed if
+  the same lag holds in every part of the overlap: unrelated clips reach z 10 by chance now and then, and one such
+  false match would put songs on top of each other, so the window says "not confirmed" and the pair is not used. When sorting is over the group that is used is
   outlined. Hover a bar for its whole title. Close the window any time; **Show matching** in the footer brings it back.
 - **YouTube login (optional).** When YouTube answers "Sign in to confirm you're not a bot", downloads fail whatever
   the video. The **YouTube login** link at the bottom of the window lets Meld use the login already saved in one of

@@ -75,8 +75,9 @@ def correlate(a, b, fs: int, band=(150.0, 5000.0), min_overlap: float = 5.0) -> 
     """GCC-PHAT cross-correlation of two mono signals.
 
     Returns (lag_seconds, z): b starts `lag` seconds after a, and z is how many standard
-    deviations the correlation peak stands above the rest (true matches score z > 25, unrelated audio rarely exceeds 8;
-    pick a threshold in between).
+    deviations the correlation peak stands above the rest (true matches score z > 25 when the recordings are good;
+    unrelated concert audio usually stays under 8 but now and then reaches 10 or more, more so for long clips, so a
+    score in between needs a second look: see `support`).
     """
     a = np.asarray(a, np.float32)
     b = np.asarray(b, np.float32)
@@ -85,7 +86,18 @@ def correlate(a, b, fs: int, band=(150.0, 5000.0), min_overlap: float = 5.0) -> 
     if min(la, lb) < min_ov:
         return 0.0, 0.0
 
-    nfft = next_fast_len(la + lb - 1, real=True)
+    cc, nfft = _phat_cc(a, b, fs, band)
+    # Only lags where the clips overlap by at least min_overlap are candidates.
+    lags = np.arange(min_ov - lb, la - min_ov + 1)
+    vals = cc[lags % nfft]
+    i = int(np.argmax(vals))
+    z = (float(vals[i]) - float(vals.mean())) / (float(vals.std()) + 1e-30)
+    return float(lags[i]) / fs, z
+
+
+def _phat_cc(a: np.ndarray, b: np.ndarray, fs: int, band=(150.0, 5000.0)) -> tuple[np.ndarray, int]:
+    """The whitened cross-correlation of two clips (as float32 arrays), circular in `nfft` points, and `nfft`."""
+    nfft = next_fast_len(len(a) + len(b) - 1, real=True)
     # workers=1 on purpose: scipy's multi-threaded FFT sometimes returned corrupt output on these large arrays
     # (about 1 run in 200: a bogus peak at a random lag), and was slower than single-threaded anyway.
     A = rfft(a - a.mean(), nfft, workers=1)
@@ -96,17 +108,43 @@ def correlate(a, b, fs: int, band=(150.0, 5000.0), min_overlap: float = 5.0) -> 
     R /= np.maximum(mag, 0.01 * mag.mean() + 1e-30)
     R[: int(band[0] * nfft / fs)] = 0
     R[int(band[1] * nfft / fs) + 1:] = 0
-    cc = irfft(R, nfft, workers=1)
-
-    # Only lags where the clips overlap by at least min_overlap are candidates.
-    lags = np.arange(min_ov - lb, la - min_ov + 1)
-    vals = cc[lags % nfft]
-    i = int(np.argmax(vals))
-    z = (float(vals[i]) - float(vals.mean())) / (float(vals.std()) + 1e-30)
-    return float(lags[i]) / fs, z
+    return irfft(R, nfft, workers=1), nfft
 
 
-CONFIDENT_Z = 25.0  # a match this strong needs no second opinion (real matches score above this, see correlate)
+def support(a, b, lag: float, fs: int, parts: int = 3, tol: float = 0.1, min_part: float = 3.0) -> list[float] | None:
+    """Does the match at `lag` (b starts `lag` seconds after a) hold up all through the overlap?
+
+    A real overlap has the same sound all along, so cutting it in `parts` and correlating each part on its own finds
+    the same lag in every one: the score here is, per part, the correlation within `tol` seconds of `lag` in standard
+    deviations of that part's own correlation. A chance peak is not there in the parts. Measured on real concert audio:
+    unrelated clips reach z=10 and more in `correlate` (one pair in 20 to 40, more the longer the clips), but score 4 to
+    5 here in a part and at most about 6 in every one; real overlaps, even with noise a lot louder than the sound
+    (-15 dB), score 11 and up in every part. Returns None when the overlap is too short to cut in two parts of at least
+    `min_part` seconds (nothing to check with), else one score per part."""
+    a = np.asarray(a, np.float32)
+    b = np.asarray(b, np.float32)
+    shift = int(round(lag * fs))
+    a0, b0 = max(0, shift), max(0, -shift)  # a[a0 + i] and b[b0 + i] are the same moment
+    n = min(len(a) - a0, len(b) - b0)
+    parts = min(parts, int(n / (min_part * fs)))
+    if parts < 2:
+        return None
+    scores = []
+    for k in range(parts):
+        i0, i1 = k * n // parts, (k + 1) * n // parts
+        part_a, part_b = a[a0 + i0: a0 + i1], b[b0 + i0: b0 + i1]
+        cc, nfft = _phat_cc(part_a, part_b, fs)
+        reach = len(part_a) // 2  # the lags where the parts still overlap by half
+        lags = np.arange(-reach, reach + 1)
+        vals = cc[lags % nfft]
+        near = vals[np.abs(lags) <= int(tol * fs)].max()
+        scores.append(float((near - vals.mean()) / (vals.std() + 1e-30)))
+    return scores
+
+
+CONFIDENT_Z = 25.0  # a match this strong needs no second opinion (real matches, undisturbed, score above this)
+MIN_SUPPORT = 7.0  # a weaker one must score this in `support` ...
+SUPPORT_PARTS = 2  # ... in this many parts of its overlap (of three). Real overlaps score at least 11 in each, in noise
 MIN_OFFERED = 3  # a group needs at least this many clips to be worth offering as a choice
 LOOSE_PASSES = 2  # how many times the clips that matched nothing get another look
 AHEAD_CLIPS, AHEAD_PAIRS = 3, 1  # idle workers get the likely first comparisons of this many next clips (this many each)
@@ -226,6 +264,7 @@ def _align_groups(
     budget = max(1, min(max_compare, total - 1))
     groups = _Groups()
     tried: dict[tuple[str, str], tuple[float, float]] = {}  # (a, b) sorted -> (lag, z): b starts `lag` s after a
+    checked: dict[tuple[str, str], bool] = {}  # (a, b) sorted -> whether its score is to be believed (see confirmed)
     compared = {n: 0 for n in order}  # comparisons each clip has been part of
     best_z = {n: 0.0 for n in order}
 
@@ -266,13 +305,13 @@ def _align_groups(
     def progress() -> str:
         return f"{len(processed)}/{total} placed" if phase == 1 else f"{retried}/{looking} placed (a second look)"
 
-    def emit(compare: tuple[str, str, float | None] | None = None) -> None:
+    def emit(compare: tuple[str, str, float | None] | None = None, doubted: bool = False) -> None:
         """Tell whoever is watching (the window) how things stand: a snapshot, so they need not follow every step."""
         if on_state is not None:
             on_state(MatchState(
                 durations=lengths, groups=tuple(dict(m) for m in groups.members.values()),
                 pending=tuple(order[pending_from:]) if phase == 1 else (), current=current, compare=compare,
-                phase=phase, compared=done, min_z=min_z,
+                phase=phase, compared=done, min_z=min_z, doubted=doubted,
             ))
 
     def compare(u: str, p: str) -> None:
@@ -288,17 +327,36 @@ def _align_groups(
         phase1_done += phase == 1
         compared[u] += 1
         compared[p] += 1
+        z = tried[(a, b)][1]
+        doubted = not confirmed(u, p)
         log(
-            f"  {u} vs {p}: z={tried[(a, b)][1]:.1f} | {progress()}, {done} comparisons, "
-            f"{format_duration(time.perf_counter() - started)} elapsed{time_left()}"
+            f"  {u} vs {p}: z={z:.1f}{' (does not hold through the overlap: not a match)' if doubted and z >= min_z else ''}"
+            f" | {progress()}, {done} comparisons, {format_duration(time.perf_counter() - started)} elapsed{time_left()}"
         )
-        emit((u, p, tried[(a, b)][1]))
+        emit((u, p, z), doubted and z >= min_z)
 
     def after(u: str, p: str) -> tuple[float, float]:
         """(lag, z) of the pair, with lag = how many seconds later u starts than p."""
         a, b = _pair(u, p)
         lag, z = tried[(a, b)]
         return (lag if b == u else -lag), z
+
+    def confirmed(u: str, p: str) -> bool:
+        """Is the score of this pair to be believed? One that is high enough (CONFIDENT_Z) always is. A middling one
+        (from min_z up) is a match only if it holds through the overlap (see `support`): among the hundreds of pairs
+        in a run there are always a few unrelated ones that reach it, and each would put a song, or a whole night, on
+        top of another. A pair too short an overlap to check is believed, as before."""
+        a, b = _pair(u, p)
+        if a == b or (a, b) not in tried:
+            return True
+        if (a, b) not in checked:
+            lag, z = tried[(a, b)]
+            if z < min_z or z >= CONFIDENT_Z:
+                checked[(a, b)] = True
+            else:
+                scores = support(audio[a], audio[b], lag, AR)
+                checked[(a, b)] = scores is None or sum(v >= MIN_SUPPORT for v in scores) >= min(SUPPORT_PARTS, len(scores))
+        return checked[(a, b)]
 
     def plan(u: str) -> list[tuple[int, int, list[str]]]:
         """In what order u is compared with the other groups, how many comparisons each may get, and its members."""
@@ -406,7 +464,7 @@ def _align_groups(
                     used += 1
                 lag, z = after(u, p)
                 best_z[u] = max(best_z[u], z)
-                if z >= min_z and (best is None or z > best[2]):
+                if z >= min_z and confirmed(u, p) and (best is None or z > best[2]):
                     best = (p, lag, z)
                 if best and best[2] >= CONFIDENT_Z:
                     break

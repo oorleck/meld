@@ -1,6 +1,6 @@
 from synth import phone, synth_music
 
-from meld.sync import correlate
+from meld.sync import MIN_SUPPORT, correlate, support
 
 SR = 16000
 
@@ -37,6 +37,30 @@ def test_unrelated_audio_is_not_a_match():
     b = phone(synth_music(60, SR, seed=2), SR, 0, 60, seed=2)
     _, z = correlate(a, b, SR)
     assert z < 8
+
+
+def test_a_real_overlap_holds_through_all_of_it_and_a_chance_peak_does_not():
+    music = synth_music(90, SR)
+    a = phone(music, SR, 0, 60, seed=1)
+    b = phone(music, SR, 20.3, 80, seed=2, gain=3.0)
+    lag, _ = correlate(a, b, SR)
+    real = support(a, b, lag, SR)
+    assert len(real) == 3 and min(real) > 3 * MIN_SUPPORT  # the same lag in every third of the overlap
+
+    other = phone(synth_music(60, SR, seed=2), SR, 0, 60, seed=2)
+    chance = support(a, other, 20.3, SR)  # some lag that is not one: the sound is not the same in any part of it
+    assert max(chance) < MIN_SUPPORT
+
+
+def test_support_at_the_wrong_lag_is_low_and_nothing_is_said_of_an_overlap_too_short_to_cut():
+    music = synth_music(90, SR)
+    a = phone(music, SR, 0, 60, seed=1)
+    b = phone(music, SR, 20.3, 80, seed=2)
+    assert max(support(a, b, 20.3 + 3.0, SR)) < MIN_SUPPORT  # 3 s out: no longer the same moment
+    eight = support(phone(music, SR, 0, 40, seed=5), phone(music, SR, 32, 90, seed=6), 32.0, SR)
+    assert len(eight) == 2 and min(eight) > MIN_SUPPORT  # an 8 s overlap is still cut in two, and holds in both
+    six_a, six_b = phone(music, SR, 0, 40, seed=5), phone(music, SR, 34.5, 90, seed=6)  # 5.5 s: too short to cut
+    assert support(six_a, six_b, 34.5, SR) is None
 
 
 def test_format_duration():
