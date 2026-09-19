@@ -196,3 +196,49 @@ def test_a_dry_run_lists_the_concerts_but_never_asks(tmp_path, fake_youtube):
 
     fetch(Project(tmp_path), [], ["q"], match_query="q", dry_run=True, choose=choose, log=lines.append)
     assert any("2 different concerts" in line for line in lines)
+
+
+# ---- fetch: audio-only previews, and not downloading twice
+
+IDS = ("aaaaaaaaaaa", "bbbbbbbbbbb")
+
+
+def _links(*ids):
+    return [f"https://www.youtube.com/watch?v={i}" for i in ids]
+
+
+@pytest.fixture
+def recorded_downloads(monkeypatch):
+    seen = []
+
+    def fake_download(opts, url):
+        seen.append((opts, url))
+        return {"id": url.rsplit("=", 1)[1], "title": "t", "uploader": "", "webpage_url": url, "duration": 60}
+
+    monkeypatch.setattr(fetch_mod, "_download", fake_download)
+    return seen
+
+
+def test_video_id_is_read_from_the_usual_kinds_of_link():
+    from meld.fetch import video_id
+
+    assert video_id("https://www.youtube.com/watch?v=E4n96UcW1ZQ") == "E4n96UcW1ZQ"
+    assert video_id("https://www.youtube.com/watch?feature=share&v=E4n96UcW1ZQ") == "E4n96UcW1ZQ"
+    assert video_id("https://youtu.be/E4n96UcW1ZQ?t=5") == "E4n96UcW1ZQ"
+    assert video_id("https://example.com/video") is None
+
+
+def test_audio_only_asks_for_just_the_sound(tmp_path, recorded_downloads):
+    fetch(Project(tmp_path / "a"), _links(IDS[0]), [], audio_only=True, log=lambda *_: None)
+    fetch(Project(tmp_path / "v"), _links(IDS[0]), [], max_height=720, log=lambda *_: None)
+    (sound, _), (video, _) = recorded_downloads
+    assert sound["format"] == "ba/b" and "merge_output_format" not in sound  # no picture, nothing to merge
+    assert "bv*[height<=720]" in video["format"] and video["merge_output_format"] == "mp4"
+
+
+def test_a_video_that_is_already_there_is_not_downloaded_again(tmp_path, recorded_downloads):
+    project = Project(tmp_path)
+    (project.clips_dir / f"{IDS[0]}.mp4").write_bytes(b"done")
+    (project.clips_dir / f"{IDS[1]}.f137.mp4").write_bytes(b"half")  # a half-finished download is not 'there'
+    fetch(project, _links(*IDS), [], log=lambda *_: None)
+    assert [url for _, url in recorded_downloads] == _links(IDS[1])

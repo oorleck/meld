@@ -7,15 +7,23 @@ from __future__ import annotations
 
 import itertools
 import json
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from . import ytdlp
 from .concerts import group_concerts
 from .media import ffmpeg_exe
-from .project import Project
+from .project import _PARTIAL, Project
 from .relevance import Relevance
 
 QUERY_SUFFIXES = ("live", "fan video", "front row", "crowd", "4K", "full song")
+_VIDEO_ID = re.compile(r"(?:[?&]v=|youtu\.be/|/shorts/)([\w-]{11})")
+
+
+def video_id(url: str) -> str | None:
+    """The YouTube id in a video link, or None."""
+    m = _VIDEO_ID.search(url)
+    return m[1] if m else None
 
 
 def expand_queries(query: str) -> list[str]:
@@ -89,10 +97,12 @@ def fetch(
     concert_only: bool = True,
     log=print,
     choose=None,
+    audio_only: bool = False,
 ) -> None:
     """`choose(concerts)`, if given, is asked which one to use when the results turn out to be from several different
-    concerts (see concerts.py): it returns one of them, or None for "use everything", or raises to abort."""
-    targets = [{"url": u, "title": None, "id": None, "uploader": None, "duration": None} for u in urls]
+    concerts (see concerts.py): it returns one of them, or None for "use everything", or raises to abort.
+    `audio_only` downloads just the sound (a fraction of the size): enough to line clips up, not to cut video."""
+    targets = [{"url": u, "title": None, "id": video_id(u), "uploader": None, "duration": None} for u in urls]
     def run_search(q: str):
         relevance = Relevance.from_query(match_query or q, require_date, concert_only) if strict else None
         return search(q, limit, min_duration, max_duration, require, relevance, log)
@@ -138,8 +148,7 @@ def fetch(
         return
 
     opts = {
-        "format": f"bv*[height<={max_height}]+ba/b[height<={max_height}]/b",
-        "merge_output_format": "mp4",
+        "format": "ba/b" if audio_only else f"bv*[height<={max_height}]+ba/b[height<={max_height}]/b",
         "outtmpl": str(project.clips_dir / "%(id)s.%(ext)s"),
         "ffmpeg_location": ffmpeg_exe(),
         "restrictfilenames": True,
@@ -148,10 +157,12 @@ def fetch(
         "quiet": True,
         "no_warnings": True,
     }
+    if not audio_only:
+        opts["merge_output_format"] = "mp4"
     sources = json.loads(project.sources_path.read_text("utf-8")) if project.sources_path.exists() else {}
     todo = []
     for t in unique:
-        if t["id"] and any(project.clips_dir.glob(f"{t['id']}.*")):
+        if t["id"] and any(not _PARTIAL.search(f.name) for f in project.clips_dir.glob(f"{t['id']}.*")):
             log(f"  already have {t['title']}")
         else:
             todo.append(t)

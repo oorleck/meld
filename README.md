@@ -14,9 +14,10 @@ ffmpeg comes bundled (via `imageio-ffmpeg`), nothing else to install.
 ## Windows app (no terminal needed)
 
 A simple window for people who don't use a terminal: type a band and a year (or a date), choose how many videos
-and the picture quality, press **Start**. It searches, downloads, lines the videos up, mixes the sound and cuts the
-video, showing the step it is on, and finishes with buttons to play the result or open its folder. **Cancel**
-stops it; videos already downloaded are kept. Run it from source with `uv run meld gui`.
+and the picture quality, press **Start**. It searches, downloads small audio-only previews, sorts them by their
+sound, downloads the videos of one group, lines them up, mixes the sound and cuts the video, showing the step it is
+on, and finishes with buttons to play the result or open its folder. **Cancel** stops it; videos already downloaded
+are kept. Run it from source with `uv run meld gui`.
 
 The picture quality (1080p, 720p or the smallest, 480p) caps how large the videos are downloaded and is also the size
 of the finished video, so 480p uses the least disk space and time; it is fine for lining the videos up and for a
@@ -36,12 +37,14 @@ optional desktop one) and shows a personal-use notice. An installed copy can be 
 `Meld.exe --selftest report.txt [--online]`.
 
 - **Several concerts in one search.** A search like "oasis 2025" finds clips of many different nights, and only one
-  night can be combined. When the results are from more than one, Meld shows a list ("4 Jul 2025 · Cardiff Principality
-  Stadium, 14 videos", ...) and only downloads the one you pick (or all of them, if you're not sure). Nights are told
-  apart by the dates in the titles (4/7/25, July 4th 2025, 04.07.25, ...), and a title with no date joins a night when
-  its venue and city words point at it. Videos that give no clue are tried with whichever night you pick and dropped
-  by the audio match if they don't fit. If the titles state no dates, Meld can't tell nights apart and uses everything,
-  as before. On the command line, `meld fetch --dry-run` / `meld auto --dry-run` list the concerts it found.
+  night can be combined. So the candidates are first downloaded as small audio-only previews (a fraction of the size of
+  the video; twice as many as videos wanted, up to 250) and sorted into groups by their sound. If there are several
+  groups of three or more videos, a "Which group?" window lists them ("Group 1: Cardiff Principality Stadium · 92 min,
+  14 videos", ...). **Only the videos of the group you pick are downloaded in full**, up to the number you asked for
+  (the longest first); each is then lined up with its preview, which is one comparison per video and not a second sync.
+  With a single group there is nothing to ask. The previews are deleted when the run ends. On the command line,
+  `meld auto` still downloads every candidate in full, and `meld fetch --dry-run` lists the concerts it can tell apart
+  from the titles.
 - **The video and the sound are saved** straight into `Documents\Meld` (or the folder you choose) as `<name>.mp4` and
   `<name>.wav`. The name is made of the words most of the YouTube titles have in common, for example
   `Coldplay at Wembley Stadium 2022`; if the titles give nothing to go on, it is what you typed. An existing file is

@@ -28,11 +28,23 @@ class Project:
         self.timeline_path = self.root / "timeline.json"
         self.sources_path = self.root / "sources.json"
 
+    def preview(self) -> "Project":
+        """A project of its own inside this one, for small audio-only copies of the candidates: they are lined up by
+        their sound to see which belong together before any full video is downloaded."""
+        return Project(self.root / "preview")
+
     def clip_files(self) -> list[Path]:
         return sorted(
             p for p in self.clips_dir.iterdir()
             if p.is_file() and p.suffix.lower() in MEDIA_EXTS and not _PARTIAL.search(p.name)
         )
+
+    def find_clip(self, stem: str) -> Path | None:
+        """The finished media file for a downloaded id (`stem`), if there is one; half-finished downloads do not count."""
+        for p in sorted(self.clips_dir.glob(f"{stem}.*")):
+            if p.suffix.lower() in MEDIA_EXTS and not _PARTIAL.search(p.name):
+                return p
+        return None
 
     def clip_path(self, entry) -> Path:
         return self.clips_dir / entry.file

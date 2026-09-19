@@ -168,3 +168,44 @@ def test_group_estimate_is_capped_and_exact_once_the_second_look_is_known():
 def test_group_estimate_is_not_tiny_before_anything_is_known():
     expected, worst = estimate_remaining_groups(25, 1e-6, [1_000_000], [1_000_000] * 40, 0, [], 0)
     assert expected > 0.3 * worst
+
+
+# ---- carrying a timeline from audio previews over to the videos downloaded afterwards
+
+
+def test_downloaded_videos_are_lined_up_with_their_previews(tmp_path):
+    import numpy as np
+
+    from meld.sync import line_up_downloads
+    from meld.timeline import ClipEntry
+
+    preview, project = Project(tmp_path / "preview"), Project(tmp_path)
+    audio = {"a": phone(A, SR, 0, 60, seed=1), "b": phone(A, SR, 40, 100, seed=2), "d": phone(A, SR, 80, 140, seed=3)}
+    for name, x in audio.items():
+        write_wav(preview.clips_dir / f"{name}.wav", x, SR)
+    write_wav(project.clips_dir / "a.wav", audio["a"], SR)  # downloaded as it was previewed
+    write_wav(project.clips_dir / "b.wav", audio["b"][4000:], SR)  # cut a quarter of a second later than its preview
+    write_wav(project.clips_dir / "d.wav", phone(B, SR, 80, 140, seed=9), SR)  # not what the preview was: other sound
+    entries = [ClipEntry(f"{n}.wav", off, 60.0, False, 0, 0) for n, off in (("a", 0.0), ("b", 40.0), ("c", 70.0), ("d", 80.0))]
+
+    logged = []
+    tl = line_up_downloads(preview, project, entries, log=logged.append)
+    assert {c.file: round(c.offset, 2) for c in tl.clips} == {"a.wav": 0.0, "b.wav": 40.25}  # b moved by what it lost
+    assert all(c.z > 25 and c.anchor for c in tl.clips)
+    reasons = {r["file"]: r["reason"] for r in tl.rejected}
+    assert reasons["c.wav"] == "the video was not downloaded"  # never downloaded
+    assert "does not match its preview" in reasons["d.wav"]  # a different recording under the same id
+    assert Timeline.load(tmp_path / "timeline.json").clips[1].file == "b.wav"  # saved as the project's timeline
+    assert any("moved +250 ms" in line for line in logged)
+
+
+def test_the_earliest_clip_that_is_left_starts_at_zero(tmp_path):
+    from meld.sync import line_up_downloads
+    from meld.timeline import ClipEntry
+
+    preview, project = Project(tmp_path / "preview"), Project(tmp_path)
+    x = phone(A, SR, 0, 60, seed=1)
+    write_wav(preview.clips_dir / "late.wav", x, SR)
+    write_wav(project.clips_dir / "late.wav", x, SR)
+    tl = line_up_downloads(preview, project, [ClipEntry("late.wav", 55.0, 60.0, False, 0, 0)], log=lambda *_: None)
+    assert [c.offset for c in tl.clips] == [0.0]  # the group's first clip may have been left out: times start again at 0

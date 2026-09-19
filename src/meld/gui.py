@@ -21,25 +21,36 @@ from .audiofuse import fuse_audio
 from .fetch import expand_queries, fetch
 from .naming import concert_name, shared_words, trim_connectors, unique_stem
 from .project import _PARTIAL, Project, slugify
-from .sync import sync_project
+from .sync import line_up_downloads, sync_project
 from .videocut import render_video
 
 APP_NAME = "Meld"
 STAGES = [
-    "Finding and downloading videos",
-    "Lining the videos up",
+    "Finding and previewing the videos",
+    "Sorting them by their sound",
+    "Downloading the chosen videos",
+    "Lining them up",
     "Mixing the sound",
     "Cutting the video",
 ]
-STEP_NAMES = ["Find videos", "Line them up", "Mix the sound", "Cut the video"]  # short forms of STAGES
+STEP_NAMES = ["Find videos", "Sort by sound", "Download", "Line them up", "Mix the sound", "Cut the video"]  # of STAGES
 IDLE_TEXT = "Ready when you are."
 EXAMPLES = ["Metallica 2003", "Coldplay Wembley 16 August 2022"]
 CLIP_CHOICES = [("A few (quickest)", 20), ("A good amount", 100), ("As many as I can find (slow)", 500)]
 QUALITY_CHOICES = [("Full HD (1080p)", 1080), ("Smaller and faster (720p)", 720), ("Smallest files (480p)", 480)]
 # The picture quality caps the download height and is also the size of the finished video.
 OUTPUT_SIZES = {1080: (1920, 1080), 720: (1280, 720), 480: (854, 480)}
-MAX_CONCERTS_SHOWN = 8  # the picker lists this many, biggest first
+MAX_GROUPS_SHOWN = 8  # the picker lists this many, biggest first
 MB_PER_CLIP = {480: 15, 720: 30, 1080: 60}  # rough download size, to warn before filling the disk
+# Candidates are first downloaded as small audio-only previews and sorted into groups by their sound; only the videos
+# of the group the user picks are downloaded in full. More candidates are previewed than videos wanted, because only
+# one of the groups they fall into is used.
+PREVIEW_FACTOR, PREVIEW_MAX, PREVIEW_MB = 2, 250, 6
+
+
+def preview_count(clips: int) -> int:
+    """How many candidates get an audio preview when `clips` videos are wanted."""
+    return min(clips * PREVIEW_FACTOR, PREVIEW_MAX)
 
 
 class Cancelled(Exception):
@@ -70,7 +81,8 @@ class Settings:
         return OUTPUT_SIZES[min(OUTPUT_SIZES)]
 
     def disk_needed_gb(self) -> float:
-        return (self.clips * MB_PER_CLIP.get(self.quality, 60) + 1500) / 1024
+        previews = preview_count(self.clips) * PREVIEW_MB
+        return (previews + self.clips * MB_PER_CLIP.get(self.quality, 60) + 1500) / 1024
 
 
 def picked_titles(project: Project, tl) -> list[str]:
@@ -110,50 +122,69 @@ def describe_groups(project: Project, groups: list) -> list[Option]:
     return options
 
 
-def run_pipeline(s: Settings, log=print, stage=lambda i, name: None, choose=None, choose_group=None) -> dict:
-    """Search, download, line up, mix and cut. The video and the sound go into `s.folder`, named after the concert.
-    `choose(concerts)` is asked which concert to use when the search finds several; `choose_group(options)` which group
-    of videos when, once lined up by their sound, there are several worth choosing between (it returns one of the
-    options). Returns {"video", "audio", "folder", "minutes", "used", "skipped"}."""
+def run_pipeline(s: Settings, log=print, stage=lambda i, name: None, choose_group=None) -> dict:
+    """Preview, sort, download, line up, mix and cut. The video and the sound go into `s.folder`, named after the concert.
+
+    Candidates are first downloaded as small audio-only previews and sorted into groups by their sound; if there are
+    several groups worth choosing between, `choose_group(options)` is asked which (it returns one of the options).
+    Only the videos of that group are then downloaded in full. Returns
+    {"video", "audio", "folder", "minutes", "used", "skipped"}."""
     project = Project(s.project_dir)
+    preview = project.preview()
+    wanted = preview_count(s.clips)
+
     stage(0, STAGES[0])
     fetch(
-        project, [], expand_queries(s.query),
-        limit=max(s.clips, 30), min_duration=20, max_duration=900, max_height=s.quality,
-        max_clips=s.clips, match_query=s.query, log=log, choose=choose,
+        preview, [], expand_queries(s.query),
+        limit=max(wanted, 30), min_duration=20, max_duration=900, max_clips=wanted, match_query=s.query,
+        log=log, audio_only=True,
     )
-    if not project.clip_files():
+    previewed = len(preview.clip_files())
+    if not previewed:
         raise UserError(
             "I couldn't find any matching videos. Try fewer words, for example just the band and the year."
         )
 
     def pick_group(groups) -> int | None:
-        options = describe_groups(project, groups)
+        options = describe_groups(preview, groups)
         answer = choose_group(options)
         return options.index(answer) if answer is not None else None
 
     stage(1, STAGES[1])
-    tl = sync_project(project, log=log, choose=pick_group if choose_group else None)
-    if not tl.clips:
+    sorted_tl = sync_project(preview, log=log, choose=pick_group if choose_group else None)
+    if not sorted_tl.clips:
         raise UserError("None of the videos could be lined up with each other, so there is nothing to combine.")
+    chosen = sorted(sorted_tl.clips, key=lambda c: -c.duration)[: s.clips]  # the longest, if the group is bigger
 
     stage(2, STAGES[2])
-    fuse_audio(project, log=log)
+    fetch(
+        project, [f"https://www.youtube.com/watch?v={Path(c.file).stem}" for c in chosen], [],
+        max_height=s.quality, max_clips=None, log=log,
+    )
 
     stage(3, STAGES[3])
+    tl = line_up_downloads(preview, project, chosen, log=log)
+    if not tl.clips:
+        raise UserError("I couldn't download the videos of that group. Please check your connection and try again.")
+
+    stage(4, STAGES[4])
+    fuse_audio(project, log=log)
+
+    stage(5, STAGES[5])
     video = render_video(project, size=s.size, log=log)
 
     stem = unique_stem(s.folder, concert_name(picked_titles(project, tl), fallback=s.query))
     log(f"Saving as {stem}")
     final_video = Path(shutil.move(str(video), str(s.folder / f"{stem}.mp4")))
     final_audio = Path(shutil.move(str(project.out_dir / "fused_audio.wav"), str(s.folder / f"{stem}.wav")))
+    shutil.rmtree(preview.root, ignore_errors=True)  # the previews have done their job
     return {
         "video": final_video,
         "audio": final_audio,
         "folder": s.folder,
         "minutes": sum(b - a for a, b in tl.segments()) / 60,
         "used": len(tl.clips),
-        "skipped": tl.left_out,
+        "skipped": previewed - len(tl.clips),
     }
 
 
@@ -173,6 +204,7 @@ def remove_working_files(project_dir: Path) -> bool:
         if f.is_file() and (f.name.split(".")[0] in ids or _PARTIAL.search(f.name)):
             f.unlink(missing_ok=True)
     shutil.rmtree(d / "cache", ignore_errors=True)
+    shutil.rmtree(d / "preview", ignore_errors=True)  # the audio previews, if a run stopped before removing them
     for name in ("timeline.json", "sources.json", "meld.log"):
         (d / name).unlink(missing_ok=True)
     for folder in (clips, d / "out", d):  # only succeeds while they are empty
@@ -672,9 +704,9 @@ def main(hook=None) -> None:
             log(f"=== {name}")
             q.put(("stage", i, name))
 
-        def ask(kind: str, items):
-            """Have the window let the user pick one of `items`, and wait. Returns it, or None for "all of them"."""
-            q.put((kind, items))
+        def choose_group(options):
+            """Have the window let the user pick one of the groups, and wait for the answer."""
+            q.put(("choose_group", options))
             while True:
                 try:
                     answer = answers.get(timeout=0.2)
@@ -686,15 +718,9 @@ def main(hook=None) -> None:
                     raise Cancelled()
                 return answer
 
-        def choose(concerts):
-            return ask("choose", concerts)
-
-        def choose_group(options):
-            return ask("choose_group", options)
-
         result = None
         try:
-            result = run_pipeline(s, log, stage, choose, choose_group)
+            result = run_pipeline(s, log, stage, choose_group)
         except Cancelled:
             q.put(("cancelled",))
         except BaseException as e:  # noqa: BLE001 - everything must reach the user
@@ -762,11 +788,13 @@ def main(hook=None) -> None:
         add_log(details)
         messagebox.showerror(APP_NAME, message + "\n\n(Choose \"Show details\" for technical information.)")
 
-    def ask_choice(items, heading: str, blurb: str, hidden: str, allow_all: bool) -> None:
-        """Let the user pick one of `items` (each with a label and a count). The answer goes to `answers`."""
-        shown = items[:MAX_CONCERTS_SHOWN]
+    def ask_group(options) -> None:
+        """Several groups of videos line up with each other, but not with the others: let the user pick one. The answer
+        (one of `options`, or "cancel") goes to `answers`."""
+        shown = options[:MAX_GROUPS_SHOWN]
+        heading = "Which group?"
         earlier_status = step_var.get()
-        step_var.set(f"Waiting for you to choose: {heading.rstrip('?').lower()}")
+        step_var.set("Waiting for you to choose a group")
 
         win = tk.Toplevel(root)
         win.withdraw()
@@ -782,25 +810,23 @@ def main(hook=None) -> None:
         body = ttk.Frame(win, padding=(px(26), px(22), px(26), px(18)))
         body.pack(fill="both", expand=True)
         ttk.Label(body, text=heading, style="Heading.TLabel").pack(anchor="w")
-        ttk.Label(body, style="Hint.TLabel", justify="left", wraplength=px(540), text=blurb).pack(
-            anchor="w", pady=(px(6), px(14))
-        )
+        ttk.Label(
+            body, style="Hint.TLabel", justify="left", wraplength=px(540),
+            text=f"By their sound, the videos fall into {len(options)} groups that don't line up with each other: "
+                 "different concerts, or parts of one that never overlap. Pick the one to combine. Only its "
+                 "videos are downloaded.",
+        ).pack(anchor="w", pady=(px(6), px(14)))
 
-        choice = tk.IntVar(value=0)  # index into `shown`; -1 = all of them
+        choice = tk.IntVar(value=0)  # index into `shown`
         for i, c in enumerate(shown):
             ttk.Radiobutton(
                 body, text=f"{c.label}      {c.count} videos", value=i, variable=choice, style="ChoiceRow.Toolbutton",
                 cursor="hand2",
             ).pack(fill="x", pady=(0, px(6)))
-        if allow_all:
-            ttk.Radiobutton(
-                body, text="Not sure: use all of them", value=-1, variable=choice, style="ChoiceRow.Toolbutton",
-                cursor="hand2",
-            ).pack(fill="x", pady=(px(6), 0))
-        if len(items) > len(shown):
-            ttk.Label(body, style="Hint.TLabel", text=f"({len(items) - len(shown)} {hidden} are not shown)").pack(
-                anchor="w", pady=(px(8), 0)
-            )
+        if len(options) > len(shown):
+            ttk.Label(
+                body, style="Hint.TLabel", text=f"({len(options) - len(shown)} groups with fewer videos are not shown)",
+            ).pack(anchor="w", pady=(px(8), 0))
 
         def finish_choice(answer) -> None:
             answers.put(answer)
@@ -815,14 +841,14 @@ def main(hook=None) -> None:
         row.pack(fill="x", pady=(px(18), 0))
         ttk.Button(
             row, text="Continue", style="Primary.TButton", cursor="hand2",
-            command=lambda: finish_choice(shown[choice.get()] if choice.get() >= 0 else None),
+            command=lambda: finish_choice(shown[choice.get()]),
         ).pack(side="left")
         ttk.Button(
             row, text="Cancel", style="Secondary.TButton", cursor="hand2", command=lambda: finish_choice("cancel"),
         ).pack(side="left", padx=px(12))
         win.protocol("WM_DELETE_WINDOW", lambda: finish_choice("cancel"))
         win.bind("<Escape>", lambda e: finish_choice("cancel"))
-        win.bind("<Return>", lambda e: finish_choice(shown[choice.get()] if choice.get() >= 0 else None))
+        win.bind("<Return>", lambda e: finish_choice(shown[choice.get()]))
 
         win.update_idletasks()  # centre it over the main window, style it, then show it
         x = root.winfo_rootx() + (root.winfo_width() - win.winfo_reqwidth()) // 2
@@ -842,20 +868,8 @@ def main(hook=None) -> None:
             while True:
                 msg = q.get_nowait()
                 kind = msg[0]
-                if kind == "choose":
-                    ask_choice(
-                        msg[1], "Which concert?",
-                        f"The videos I found are from {len(msg[1])} different concerts. Pick the one to combine. "
-                        "Videos that don't say which concert they are from are tried too.",
-                        "concerts with fewer videos", allow_all=True,
-                    )
-                elif kind == "choose_group":
-                    ask_choice(
-                        msg[1], "Which group?",
-                        f"By their sound, the videos fall into {len(msg[1])} groups that don't line up with each other: "
-                        "different concerts, or parts of one that never overlap. Pick the one to combine.",
-                        "groups with fewer videos", allow_all=False,
-                    )
+                if kind == "choose_group":
+                    ask_group(msg[1])
                 elif kind == "stage":
                     step_var.set(f"Step {msg[1] + 1} of {len(STAGES)}: {msg[2]}")
                     set_step(msg[1])

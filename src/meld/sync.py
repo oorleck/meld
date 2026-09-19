@@ -5,6 +5,8 @@ import json
 import math
 import subprocess
 import time
+from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 from scipy.fft import irfft, next_fast_len, rfft
@@ -539,4 +541,43 @@ def sync_project(
             log(f"  group {n}: {c.file}  {titles.get(c.file, '')}")
     for r in rejected:
         log(f"  rejected {r['file']}: {r['reason']}  {titles.get(r['file'], '')}")
+    return tl
+
+
+def line_up_downloads(
+    preview: Project, project: Project, entries: list[ClipEntry], min_z: float = 10.0, log=print,
+) -> Timeline:
+    """Carry a timeline made from audio previews over to the videos downloaded afterwards.
+
+    `entries` are the chosen clips as they were lined up in `preview`. The sound of each downloaded video is the
+    sound of its preview, but the files are not cut at exactly the same place, so each video is correlated with its own
+    preview (one comparison per clip, not a whole new sync) and moves by the small shift found. A video that is missing,
+    or whose sound does not match its preview, is left out. The result is saved as the project's timeline."""
+    clips: list[ClipEntry] = []
+    rejected: list[dict] = []
+    for e in entries:
+        video = project.find_clip(Path(e.file).stem)
+        if video is None:
+            rejected.append({"file": e.file, "reason": "the video was not downloaded"})
+            continue
+        try:
+            info = probe(video)
+            x = np.asarray(load_audio(video, project.cache_dir, AR))
+            before = np.asarray(load_audio(preview.clip_path(e), preview.cache_dir, AR))
+        except (subprocess.CalledProcessError, RuntimeError, OSError) as err:
+            rejected.append({"file": video.name, "reason": f"could not decode: {err}"})
+            continue
+        lag, z = correlate(before, x, AR)  # the video starts `lag` seconds after its preview
+        log(f"  {video.name}: lined up with its preview (z={z:.1f}, moved {lag * 1000:+.0f} ms)")
+        if z < min_z:
+            rejected.append({"file": video.name, "reason": f"the video does not match its preview (z={z:.1f})"})
+            continue
+        clips.append(ClipEntry(
+            file=video.name, offset=e.offset + lag, duration=len(x) / AR, has_video=info.has_video,
+            width=info.width, height=info.height, z=z, anchor=e.file,
+        ))
+    shift = min((c.offset for c in clips), default=0.0)
+    clips = sorted((replace(c, offset=c.offset - shift) for c in clips), key=lambda c: c.offset)
+    tl = Timeline(clips, rejected)
+    tl.save(project.timeline_path)
     return tl

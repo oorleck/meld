@@ -1,5 +1,6 @@
 """Tests for the GUI's logic. The window itself needs a display; the pipeline behind it does not."""
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -49,22 +50,62 @@ def test_friendly_errors():
     assert friendly_error(ValueError("boom")).startswith("Something went wrong")
 
 
-def _make_project_clips(s: Settings) -> None:
-    clips = s.project_dir / "clips"
-    clips.mkdir(parents=True)
+class FakeYouTube:
+    """Stands in for fetch(). 'YouTube' is a folder of finished clips (<id>.mp4). A search puts up to max_clips of them
+    in the project it is given, a download of links puts just those; every call is recorded."""
+
+    def __init__(self, folder: Path, titles: dict | None = None):
+        self.folder = folder
+        self.titles = titles or {}
+        self.calls: list[tuple[str, bool, list[str], int | None]] = []  # (kind, audio only, ids, max height)
+        folder.mkdir(parents=True, exist_ok=True)
+
+    def add(self, name: str, audio, video_src: str = "testsrc2=size=640x360:rate=30") -> None:
+        make_clip(self.folder / f"{name}.mp4", audio, SR, video_src)
+
+    def __call__(self, project, urls, queries, **kw) -> None:
+        ids = sorted(p.stem for p in self.folder.glob("*.mp4")) if queries else [u.rsplit("=", 1)[1] for u in urls]
+        if queries:
+            ids = ids[: kw.get("max_clips") or len(ids)]
+        for i in ids:
+            if not (project.clips_dir / f"{i}.mp4").exists():
+                shutil.copy(self.folder / f"{i}.mp4", project.clips_dir / f"{i}.mp4")
+        sources = json.loads(project.sources_path.read_text("utf-8")) if project.sources_path.exists() else {}
+        sources.update({i: {"title": self.titles.get(i)} for i in ids})
+        project.sources_path.write_text(json.dumps(sources), encoding="utf-8")
+        kind = "preview" if project.root.name == "preview" else "video"
+        self.calls.append((kind, bool(kw.get("audio_only")), ids, kw.get("max_height")))
+
+    def downloaded(self, kind: str) -> list[str]:
+        return [i for k, _, ids, _ in self.calls if k == kind for i in ids]
+
+
+def _one_concert(yt: FakeYouTube) -> None:
+    """Two phones at the same show: together they cover 70 s of it."""
     music = synth_music(70, SR)
-    make_clip(clips / "a.mp4", phone(music, SR, 0, 45, seed=1), SR, "testsrc2=size=640x360:rate=30")
-    make_clip(clips / "b.mp4", phone(music, SR, 25, 70, seed=2), SR, "rgbtestsrc=size=640x360:rate=30")
+    yt.add("a", phone(music, SR, 0, 45, seed=1))
+    yt.add("b", phone(music, SR, 25, 70, seed=2), "rgbtestsrc=size=640x360:rate=30")
 
 
-def test_pipeline_runs_all_four_stages_and_reports(tmp_path, monkeypatch):
+def _two_concerts(yt: FakeYouTube) -> None:
+    """Three phones at each of two different shows; the first show's clips cover 70 s, the second's 60 s."""
+    a, b = synth_music(70, SR), synth_music(70, SR, seed=5)
+    for name, music, t0, t1, seed in [
+        ("a1", a, 0, 45, 1), ("a2", a, 25, 70, 2), ("a3", a, 10, 55, 3),
+        ("b1", b, 0, 40, 4), ("b2", b, 20, 60, 5), ("b3", b, 10, 50, 6),
+    ]:
+        yt.add(name, phone(music, SR, t0, t1, seed=seed))
+
+
+def test_pipeline_runs_all_six_stages_and_reports(tmp_path, monkeypatch):
+    yt = FakeYouTube(tmp_path / "youtube")
+    _one_concert(yt)
+    monkeypatch.setattr(gui, "fetch", yt)
     s = Settings("test show 2024", tmp_path, clips=20, quality=720)
-    _make_project_clips(s)
-    monkeypatch.setattr(gui, "fetch", lambda *a, **k: None)  # no internet: the clips are already there
     stages = []
     result = run_pipeline(s, log=lambda *_: None, stage=lambda i, name: stages.append((i, name)))
 
-    assert [i for i, _ in stages] == [0, 1, 2, 3]
+    assert [i for i, _ in stages] == [0, 1, 2, 3, 4, 5] == list(range(len(gui.STAGES)))
     # no video titles are known here, so the files are named after the search; they go straight into the save folder
     assert result["video"] == tmp_path / "Test Show 2024.mp4" and result["video"].exists()
     assert result["audio"] == tmp_path / "Test Show 2024.wav" and result["audio"].exists()
@@ -72,51 +113,77 @@ def test_pipeline_runs_all_four_stages_and_reports(tmp_path, monkeypatch):
     assert not (s.project_dir / "out" / "fused.mp4").exists()  # moved, not copied
     assert result["used"] == 2 and result["skipped"] == 0
     assert 1.0 < result["minutes"] < 1.4  # the two clips together cover 70 s
+    # first small audio-only previews of the candidates, then the videos themselves
+    assert [(kind, audio_only) for kind, audio_only, _, _ in yt.calls] == [("preview", True), ("video", False)]
+    assert not (s.project_dir / "preview").exists()  # the previews have done their job
+
+
+def test_only_the_chosen_groups_videos_are_downloaded(tmp_path, monkeypatch):
+    yt = FakeYouTube(tmp_path / "youtube")
+    _two_concerts(yt)
+    monkeypatch.setattr(gui, "fetch", yt)
+    shown = []
+
+    def choose_group(options):
+        shown.extend(options)
+        return options[1]  # the second show
+
+    s = Settings("two shows 2024", tmp_path, clips=20, quality=480)
+    result = run_pipeline(s, log=lambda *_: None, choose_group=choose_group)
+    assert [(o.label.split(" ")[0:2], o.count) for o in shown] == [(["Group", "1"], 3), (["Group", "2"], 3)]
+    assert sorted(yt.downloaded("preview")) == ["a1", "a2", "a3", "b1", "b2", "b3"]  # everything was previewed ...
+    assert sorted(yt.downloaded("video")) == ["b1", "b2", "b3"]  # ... but only the chosen group's videos were downloaded
+    assert result["used"] == 3 and result["skipped"] == 3
+    assert 0.9 < result["minutes"] < 1.1  # the 60 s of the second show
+
+
+def test_without_a_choice_the_biggest_group_is_used_and_only_its_videos_downloaded(tmp_path, monkeypatch):
+    yt = FakeYouTube(tmp_path / "youtube")
+    _two_concerts(yt)
+    monkeypatch.setattr(gui, "fetch", yt)
+    result = run_pipeline(Settings("two shows 2024", tmp_path, clips=20), log=lambda *_: None)
+    assert sorted(yt.downloaded("video")) == ["a1", "a2", "a3"]  # the show that covers the most time
+    assert result["used"] == 3 and result["skipped"] == 3
+
+
+def test_no_more_videos_are_downloaded_than_asked_for(tmp_path, monkeypatch):
+    yt = FakeYouTube(tmp_path / "youtube")
+    music = synth_music(70, SR)
+    for name, t0, t1, seed in [("a1", 0, 50, 1), ("a2", 20, 60, 2), ("a3", 30, 65, 3), ("a4", 10, 35, 4)]:
+        yt.add(name, phone(music, SR, t0, t1, seed=seed))
+    monkeypatch.setattr(gui, "fetch", yt)
+    result = run_pipeline(Settings("few 2024", tmp_path, clips=2), log=lambda *_: None)
+    assert sorted(yt.downloaded("video")) == ["a1", "a2"]  # the two longest of the group of four
+    assert result["used"] == 2 and result["skipped"] == 2
+    assert len(yt.calls[0][2]) <= gui.preview_count(2)  # and no more previewed than the preview allowance
 
 
 def test_smallest_quality_caps_the_download_and_sizes_the_video(tmp_path, monkeypatch):
     from meld.media import probe
 
-    s = Settings("small show 2024", tmp_path, clips=20, quality=480)
-    _make_project_clips(s)
-    asked = {}
-    monkeypatch.setattr(gui, "fetch", lambda *a, **k: asked.update(k))
-    result = run_pipeline(s, log=lambda *_: None)
-    assert asked["max_height"] == 480  # what YouTube is asked for
+    yt = FakeYouTube(tmp_path / "youtube")
+    _one_concert(yt)
+    monkeypatch.setattr(gui, "fetch", yt)
+    result = run_pipeline(Settings("small show 2024", tmp_path, clips=20, quality=480), log=lambda *_: None)
+    assert [max_height for kind, _, _, max_height in yt.calls if kind == "video"] == [480]  # what YouTube is asked for
     info = probe(result["video"])
     assert (info.width, info.height) == (854, 480)  # what comes out
 
 
 def test_pipeline_names_the_files_after_the_videos_it_used(tmp_path, monkeypatch):
+    yt = FakeYouTube(tmp_path / "youtube", titles={
+        "a": "Test Band - Song One (Live at Big Arena 2024) 4K",
+        "b": "TEST BAND Big Arena 2024 - Song Two",
+    })
+    _one_concert(yt)
+    monkeypatch.setattr(gui, "fetch", yt)
     s = Settings("test band 2024", tmp_path, clips=20, quality=720)
-    _make_project_clips(s)
-    (s.project_dir / "sources.json").write_text(json.dumps({
-        "a": {"title": "Test Band - Song One (Live at Big Arena 2024) 4K"},
-        "b": {"title": "TEST BAND Big Arena 2024 - Song Two"},
-    }), encoding="utf-8")
-    monkeypatch.setattr(gui, "fetch", lambda *a, **k: None)
     first = run_pipeline(s, log=lambda *_: None)
     assert first["video"].name == "Test Band Big Arena 2024.mp4"
     assert first["audio"].name == "Test Band Big Arena 2024.wav"
 
     second = run_pipeline(s, log=lambda *_: None)  # the same concert again must not overwrite the first
     assert second["video"].name == "Test Band Big Arena 2024 (2).mp4" and first["video"].exists()
-
-
-def test_pipeline_uses_the_biggest_group_and_counts_the_other_groups_as_left_out(tmp_path, monkeypatch):
-    s = Settings("two shows 2024", tmp_path, clips=20, quality=480)
-    clips = s.project_dir / "clips"
-    clips.mkdir(parents=True)
-    a, b = synth_music(70, SR), synth_music(70, SR, seed=5)  # two different concerts
-    make_clip(clips / "a1.mp4", phone(a, SR, 0, 45, seed=1), SR, "testsrc2=size=640x360:rate=30")
-    make_clip(clips / "a2.mp4", phone(a, SR, 25, 70, seed=2), SR, "rgbtestsrc=size=640x360:rate=30")
-    make_clip(clips / "b1.mp4", phone(b, SR, 0, 40, seed=3), SR, "testsrc2=size=640x360:rate=30")
-    make_clip(clips / "b2.mp4", phone(b, SR, 20, 60, seed=4), SR, "rgbtestsrc=size=640x360:rate=30")
-    monkeypatch.setattr(gui, "fetch", lambda *a, **k: None)
-    result = run_pipeline(s, log=lambda *_: None)
-    assert result["used"] == 2
-    assert result["skipped"] == 2  # the other concert's two clips line up with each other, but are not used
-    assert 1.0 < result["minutes"] < 1.3  # the 70 s of the first concert, not the 60 s of the second
 
 
 def _timeline_of(*ids):
@@ -149,10 +216,10 @@ def test_group_rows_name_the_place_that_tells_the_groups_apart(tmp_path):
 
 
 def test_pipeline_asks_which_group_and_hands_the_answer_to_sync(tmp_path, monkeypatch):
+    yt = FakeYouTube(tmp_path / "youtube")
+    yt.add("x", phone(synth_music(20, SR), SR, 0, 15, seed=1))  # something to preview: sync itself is stubbed
+    monkeypatch.setattr(gui, "fetch", yt)
     s = Settings("ask me 2024", tmp_path)
-    (s.project_dir / "clips").mkdir(parents=True)
-    (s.project_dir / "clips" / "x.mp4").write_bytes(b"x")  # only has to exist: fetch and sync are stubbed
-    monkeypatch.setattr(gui, "fetch", lambda *a, **k: None)
     seen = {}
 
     def fake_sync(project, log, choose):
@@ -177,8 +244,9 @@ def test_pipeline_asks_which_group_and_hands_the_answer_to_sync(tmp_path, monkey
 
 def _fake_working_folder(root: Path) -> Path:
     d = root / "some-search"
-    for sub in ("clips", "cache/audio", "out"):
+    for sub in ("clips", "cache/audio", "out", "preview/clips"):
         (d / sub).mkdir(parents=True)
+    (d / "preview" / "clips" / "vid1.m4a").write_bytes(b"x")  # an audio preview a stopped run left behind
     (d / "sources.json").write_text(json.dumps({"vid1": {"title": "x"}, "vid2": {"title": "y"}}), encoding="utf-8")
     for name in ("vid1.mp4", "vid2.webm", "vid3.f137.mp4", "vid3.mp4.part"):  # downloads; the last two half-finished
         (d / "clips" / name).write_bytes(b"x")
@@ -221,9 +289,10 @@ def test_pipeline_with_no_clips_explains_itself(tmp_path, monkeypatch):
 
 
 def test_cancel_unwinds_from_the_log_callback(tmp_path, monkeypatch):
+    yt = FakeYouTube(tmp_path / "youtube")
+    _one_concert(yt)
+    monkeypatch.setattr(gui, "fetch", yt)
     s = Settings("cancel me", tmp_path)
-    _make_project_clips(s)
-    monkeypatch.setattr(gui, "fetch", lambda *a, **k: None)
     calls = {"n": 0}
 
     def log(msg=""):
@@ -234,6 +303,7 @@ def test_cancel_unwinds_from_the_log_callback(tmp_path, monkeypatch):
     with pytest.raises(Cancelled):
         run_pipeline(s, log=log)
     assert not (s.project_dir / "out" / "fused.mp4").exists()
+    assert not list(tmp_path.glob("*.mp4"))  # nothing was saved
 
 
 def test_shorten_path_keeps_both_ends():
