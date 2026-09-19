@@ -260,3 +260,49 @@ def test_the_saved_sorting_is_the_one_after_the_audit(tmp_path, monkeypatch):
     second, lines = sync(project, remember=True)
     assert any("before: using that" in line for line in lines)
     assert groups_of(first) == groups_of(second) == [{"a1", "a2", "a3", "a4", "a5"}, {"b1", "b2", "b3", "b4"}]
+
+
+# ---- copies of one recording do not vouch for each other
+
+def test_copies_of_one_recording_do_not_confirm_a_wrong_match_for_each_other(tmp_path, monkeypatch):
+    # In a real run a group held a concert film uploaded again and again: many copies of one sound. A clip of another song
+    # matched one of them (z=15, and it passed the check of the match: the two recordings are alike), and every copy has
+    # the same false peak, so every copy "agreed" with it. Only clips that are not copies can be asked.
+    recording = phone(A, SR, 0, 100, seed=1)
+    project = Project(tmp_path)
+    for name in ("c1", "c2", "c3"):
+        write_wav(project.clips_dir / f"{name}.wav", recording, SR)  # the very same sound
+    write_wav(project.clips_dir / "u.wav", phone(B, SR, 100, 147, seed=9), SR)
+    forced(monkeypatch, {(100, 47): (40.0, 15.0)})  # each copy matches u alike, and "agrees" with it
+    tl, lines = sync(project)
+    assert groups_of(tl)[0] == {"c1", "c2", "c3"} and "u" not in names(tl.clips)
+    assert any("u.wav" in line and "not backed up" in line for line in lines)
+
+
+def test_without_that_rule_the_copies_would_have_let_the_wrong_match_in(tmp_path, monkeypatch):
+    recording = phone(A, SR, 0, 100, seed=1)
+    project = Project(tmp_path)
+    for name in ("c1", "c2", "c3"):
+        write_wav(project.clips_dir / f"{name}.wav", recording, SR)
+    write_wav(project.clips_dir / "u.wav", phone(B, SR, 100, 147, seed=9), SR)
+    forced(monkeypatch, {(100, 47): (40.0, 15.0)})
+    monkeypatch.setattr(sync_mod, "IDENTICAL_Z", 10**9)  # no clip counts as a copy of another
+    monkeypatch.setattr(sync_mod, "audit_groups", lambda *a, **k: 0)  # (the audit would take it out again: see below)
+    tl, _ = sync(project)
+    assert "u" in names(tl.clips)  # the copies agreed, and u was put in among them
+
+
+def test_the_audit_does_not_ask_copies_of_the_clip_a_cluster_hangs_on():
+    spec = {"c1": (A, 0, 100), "c2": (A, 0, 100), "c3": (A, 0, 100), "c4": (A, 0, 100), "s1": (A, 30, 128)}
+    audio = audio_of(spec)
+    audio["c2"], audio["c3"], audio["c4"] = audio["c1"], audio["c1"], audio["c1"]  # copies: the very same sound
+    offsets = {"c1": 0.0, "c2": 0.0, "c3": 0.0, "c4": 0.0, "s1": 30.0}
+    for z, kept in ((12.0, False), (UNVERIFIED_Z + 2.0, True)):
+        links = {"c2": ("c1", 3000.0), "c3": ("c1", 3000.0), "c4": ("c1", 3000.0), "s1": ("c1", z)}
+        lines = []
+        with_copies = audit_groups(group_of(offsets, links), audio, lines.append, copies=lambda n: {"c1", "c2", "c3", "c4"} if n == "c1" else {n})
+        without = audit_groups(group_of(offsets, links), audio, lambda *_: None)  # copies are asked, and agree: it stays
+        assert without == 0
+        assert with_copies == (0 if kept else 1), z  # only copies could say: believed only if the link is fairly strong
+        if not kept:
+            assert any("nothing else in the group was there to agree" in line for line in lines)

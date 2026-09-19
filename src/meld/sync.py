@@ -114,22 +114,25 @@ def _phat_cc(a: np.ndarray, b: np.ndarray, fs: int, band=(150.0, 5000.0)) -> tup
     return irfft(R, nfft, workers=1), nfft
 
 
-def support(a, b, lag: float, fs: int, parts: int = 3, tol: float = 0.1, min_part: float = 3.0) -> list[float] | None:
+def support(a, b, lag: float, fs: int, window: float = 8.0, tol: float = 0.1, min_window: float = 3.0) -> list[float] | None:
     """Does the match at `lag` (b starts `lag` seconds after a) hold up all through the overlap?
 
-    A real overlap has the same sound all along, so cutting it in `parts` and correlating each part on its own finds
-    the same lag in every one: the score here is, per part, the correlation within `tol` seconds of `lag` in standard
-    deviations of that part's own correlation. A chance peak is not there in the parts. Measured on real concert audio:
-    unrelated clips reach z=10 and more in `correlate` (one pair in 20 to 40, more the longer the clips), but score 4 to
-    5 here in a part and at most about 6 in every one; real overlaps, even with noise a lot louder than the sound
-    (-15 dB), score 11 and up in every part. Returns None when the overlap is too short to cut in two parts of at least
-    `min_part` seconds (nothing to check with), else one score per part."""
+    A real overlap has the same sound all along, so the overlap is cut in windows (of `window` seconds; a short overlap in
+    three, but not shorter than `min_window`) and each is correlated on its own: the score is, per window, the correlation
+    within `tol` seconds of `lag` in standard deviations of that window's own correlation. A match that is real peaks in
+    (nearly) every window. A chance peak is in none, and a match between clips that are not the same sound but are alike
+    (two songs of one band, one recording: the same instruments and room, and stretches of sound in common) peaks in only
+    some. Measured on real concert audio, that is what the check has to tell apart: with windows of 8 s and a peak of 6 in
+    at least 60% of them (see `holds`), 8% of pairs of different songs that scored z=10 to 30 passed, against 75 to 82%
+    with the overlap cut in thirds, while 87% of real matches with noise as loud as the sound (-10 dB) passed and no pair of
+    unrelated clips did. Returns None when the overlap is too short for two windows, else one score per window."""
     a = np.asarray(a, np.float32)
     b = np.asarray(b, np.float32)
     shift = int(round(lag * fs))
     a0, b0 = max(0, shift), max(0, -shift)  # a[a0 + i] and b[b0 + i] are the same moment
     n = min(len(a) - a0, len(b) - b0)
-    parts = min(parts, int(n / (min_part * fs)))
+    length = max(min(window, n / fs / 3), min_window)
+    parts = int(n / (length * fs))
     if parts < 2:
         return None
     scores = []
@@ -145,10 +148,19 @@ def support(a, b, lag: float, fs: int, parts: int = 3, tol: float = 0.1, min_par
     return scores
 
 
+def holds(scores: list[float]) -> bool:
+    """Does a match hold, going by the scores `support` gave: does at least SUPPORT_SHARE of the windows peak?"""
+    return sum(v >= MIN_SUPPORT for v in scores) >= SUPPORT_SHARE * len(scores) - 1e-9
+
+
 CONFIDENT_Z = 25.0  # a match this strong needs no second opinion (real matches, undisturbed, score above this)
-MIN_SUPPORT = 7.0  # a weaker one must score this in `support` ...
-SUPPORT_PARTS = 2  # ... in this many parts of its overlap (of three). Real overlaps score at least 11 in each, in noise
-SORT_REVISION = 2  # changes when the way clips are put into groups does. A sorting saved by an earlier way is then done
+MIN_SUPPORT = 6.0  # a weaker one must score this in a window of its overlap (`support`) ...
+SUPPORT_SHARE = 0.6  # ... in this share of the windows (`holds`)
+SUPPORT_REVISION = 2  # changes when `support` does: the scores of it that were saved are then worked out again
+IDENTICAL_Z = 100.0  # two clips that match this well are one recording, however many copies of it there are (what real
+# phones, at different places, do not reach). A false match is a property of the two recordings, not of a clip: every
+# copy of the one has it, and so agrees with a clip that joins wrongly. Only clips that are not copies can confirm it.
+SORT_REVISION = 3  # changes when the way clips are put into groups does. A sorting saved by an earlier way is then done
 # again, from the scores of pairs that were saved (they do not depend on it), instead of being used as it is
 MIN_OFFERED = 3  # a group needs at least this many clips to be worth offering as a choice
 LOOSE_PASSES = 2  # how many times the clips that matched nothing get another look
@@ -317,15 +329,16 @@ def clusters_agree(first, second, offsets: dict, audio: dict) -> bool | None:
     scores = support(_aggregate(second, offsets, audio, lo, hi), _aggregate(first, offsets, audio, lo, hi), 0.0, AR)
     if scores is None:
         return None
-    return sum(v >= MIN_SUPPORT for v in scores) >= min(SUPPORT_PARTS, len(scores))
+    return holds(scores)
 
 
-def audit_groups(groups: "_Groups", audio: dict, log=print, on_change=None) -> int:
+def audit_groups(groups: "_Groups", audio: dict, log=print, on_change=None, copies=None) -> int:
     """Look at every group again, now that everything is known, and set apart the clusters that do not belong.
 
     A cluster hangs from a link, and a link below CONFIDENT_Z may be a chance. Everything that hangs on it (the clip and
     all clips that were lined up through it) is taken as one cluster, and added up; the rest of the group, less the
-    clip the link goes to (the link is what is in question), is added up too; and if the two do not sound the same where
+    clip the link goes to and its copies (the link is what is in question, and a copy of the clip has what it has), is
+    added up too; and if the two do not sound the same where
     they are both there, the cluster is set apart. If they are not both there at all (nothing else was filming while the
     cluster was), it stays only if the link is UNVERIFIED_Z or more. The outermost links are looked at first, and what
     hangs on a cluster that goes goes with it. Returns how many clusters were set apart."""
@@ -354,7 +367,7 @@ def audit_groups(groups: "_Groups", audio: dict, log=print, on_change=None) -> i
                 rest = set(members) - cluster
                 if len(rest) < CORROBORATE_FROM or (c, len(cluster), len(rest)) in checked:
                     continue
-                verdict = clusters_agree(cluster, rest - {anchor}, members, audio)
+                verdict = clusters_agree(cluster, rest - (copies(anchor) if copies else {anchor}), members, audio)
                 if verdict is True or (verdict is None and z >= UNVERIFIED_Z):
                     checked.add((c, len(cluster), len(rest)))
                     continue
@@ -463,6 +476,7 @@ def _align_groups(
     groups = _Groups()
     tried: dict[tuple[str, str], tuple[float, float]] = {}  # (a, b) sorted -> (lag, z): b starts `lag` s after a
     checked: dict[tuple[str, str], bool] = {}  # (a, b) sorted -> whether its score is to be believed (see confirmed)
+    same_sound: dict[str, set[str]] = {}  # clip -> the clips it matches with IDENTICAL_Z or more: copies of one recording
     compared = {n: 0 for n in order}  # comparisons each clip has been part of
     best_z = {n: 0.0 for n in order}
 
@@ -536,6 +550,9 @@ def _align_groups(
         compared[u] += 1
         compared[p] += 1
         z = tried[(a, b)][1]
+        if z >= IDENTICAL_Z:
+            same_sound.setdefault(a, set()).add(b)
+            same_sound.setdefault(b, set()).add(a)
         doubted = not confirmed(u, p)
         if quiet:
             return
@@ -568,7 +585,7 @@ def _align_groups(
                 if (a, b) not in supports:
                     supports[(a, b)] = support(audio[a], audio[b], lag, AR)
                 scores = supports[(a, b)]
-                checked[(a, b)] = scores is None or sum(v >= MIN_SUPPORT for v in scores) >= min(SUPPORT_PARTS, len(scores))
+                checked[(a, b)] = scores is None or holds(scores)
         return checked[(a, b)]
 
     def plan(u: str) -> list[tuple[int, int, list[str]]]:
@@ -706,9 +723,19 @@ def _align_groups(
             return None
         for m in asked:
             scores = support(audio[m], audio[u], offset - members[m], AR)
-            if scores is not None and sum(v >= MIN_SUPPORT for v in scores) >= min(SUPPORT_PARTS, len(scores)):
+            if scores is not None and holds(scores):
                 return True
         return False
+
+    def copies_of(name: str) -> set[str]:
+        """`name` and every clip that is the same recording as it (matches it with IDENTICAL_Z or more, or matches one that does)."""
+        seen, todo = {name}, [name]
+        while todo:
+            for other in same_sound.get(todo.pop(), ()):
+                if other not in seen:
+                    seen.add(other)
+                    todo.append(other)
+        return seen
 
     def believable(u: str, gid: int, entry: tuple[str, float, float]) -> bool:
         """Is u's best match in group `gid` to be believed? A strong one is. A weak one, to a group that is not small, is
@@ -717,7 +744,7 @@ def _align_groups(
         p, lag, z = entry
         if z >= CONFIDENT_Z or len(groups.members[gid]) < CORROBORATE_FROM:
             return True
-        verdict = others_agree(u, groups.members[gid][p] + lag, gid, {p})
+        verdict = others_agree(u, groups.members[gid][p] + lag, gid, copies_of(p))  # not by copies of the clip it matched
         if verdict is None:
             return z >= UNVERIFIED_Z
         return verdict
@@ -775,7 +802,7 @@ def _align_groups(
             break
     current = None
     emit()
-    apart = audit_groups(groups, audio, log, on_change=emit)  # with everything known, does every cluster belong where it is?
+    apart = audit_groups(groups, audio, log, on_change=emit, copies=copies_of)  # with everything known, does every cluster belong where it is?
     if apart:
         log(f"{apart} cluster(s) were set apart.")
     log(
@@ -895,9 +922,10 @@ def _remembered_pairs(project: Project, ids: dict[str, int], min_overlap: float)
         for a, b, lag, z in stored["pairs"]:
             if same(a) and same(b):
                 known[(a, b)] = (lag, z)
-        for a, b, scores in stored["support"]:
-            if (a, b) in known:
-                supports[(a, b)] = scores
+        if stored.get("support_rev") == SUPPORT_REVISION:  # what `support` said before may not be what it says now
+            for a, b, scores in stored["support"]:
+                if (a, b) in known:
+                    supports[(a, b)] = scores
     return known, supports, key
 
 
@@ -905,6 +933,7 @@ def _save_pairs(project: Project, key: str, ids: dict[str, int], known: dict, su
     """Remember the scores worked out, of the clips that are still in the project."""
     cache.save(project.root, "pairs", key, {
         "clips": ids,
+        "support_rev": SUPPORT_REVISION,
         "pairs": [[a, b, lag, z] for (a, b), (lag, z) in known.items() if a in ids and b in ids],
         "support": [[a, b, sc] for (a, b), sc in supports.items() if (a, b) in known and a in ids and b in ids],
     })

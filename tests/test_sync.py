@@ -1,6 +1,7 @@
+import numpy as np
 from synth import phone, synth_music
 
-from meld.sync import MIN_SUPPORT, correlate, support
+from meld.sync import MIN_SUPPORT, SUPPORT_SHARE, correlate, holds, support
 
 SR = 16000
 
@@ -39,26 +40,41 @@ def test_unrelated_audio_is_not_a_match():
     assert z < 8
 
 
-def test_a_real_overlap_holds_through_all_of_it_and_a_chance_peak_does_not():
+def test_a_real_overlap_holds_in_every_window_and_a_chance_peak_does_not():
     music = synth_music(90, SR)
     a = phone(music, SR, 0, 60, seed=1)
     b = phone(music, SR, 20.3, 80, seed=2, gain=3.0)
     lag, _ = correlate(a, b, SR)
     real = support(a, b, lag, SR)
-    assert len(real) == 3 and min(real) > 3 * MIN_SUPPORT  # the same lag in every third of the overlap
+    assert len(real) == 4 and min(real) > 3 * MIN_SUPPORT and holds(real)  # the same lag in every window of the overlap
 
     other = phone(synth_music(60, SR, seed=2), SR, 0, 60, seed=2)
     chance = support(a, other, 20.3, SR)  # some lag that is not one: the sound is not the same in any part of it
-    assert max(chance) < MIN_SUPPORT
+    assert max(chance) < MIN_SUPPORT and not holds(chance)
+
+
+def test_a_match_that_holds_in_only_part_of_the_overlap_does_not_hold():
+    # two recordings that are alike for part of the time (the same instruments, room and crowd, some of the same sound)
+    # but not the same performance: what pairs of different songs of one concert are. The overlap cut in thirds let 75 to 82%
+    # of such pairs through on real audio; a peak in most of the windows is what a real match has.
+    first, second = synth_music(120, SR, seed=21), synth_music(120, SR, seed=22)
+    shared = phone(first, SR, 0, 60, seed=1)  # 60 s of the same sound ...
+    a = np.concatenate([shared, phone(first, SR, 60, 120, seed=2)])
+    b = np.concatenate([phone(first, SR, 0, 60, seed=3), phone(second, SR, 60, 120, seed=4)])  # ... then another song
+    scores = support(a, b, 0.0, SR)
+    assert sum(v >= MIN_SUPPORT for v in scores) >= 0.4 * len(scores)  # it is there where the sound is the same ...
+    assert not holds(scores)  # ... but that is not most of the overlap
+    whole = support(a, np.concatenate([phone(first, SR, 0, 60, seed=3), phone(first, SR, 60, 120, seed=5)]), 0.0, SR)
+    assert holds(whole) and SUPPORT_SHARE == 0.6
 
 
 def test_support_at_the_wrong_lag_is_low_and_nothing_is_said_of_an_overlap_too_short_to_cut():
     music = synth_music(90, SR)
     a = phone(music, SR, 0, 60, seed=1)
     b = phone(music, SR, 20.3, 80, seed=2)
-    assert max(support(a, b, 20.3 + 3.0, SR)) < MIN_SUPPORT  # 3 s out: no longer the same moment
+    assert not holds(support(a, b, 20.3 + 3.0, SR))  # 3 s out: no longer the same moment
     eight = support(phone(music, SR, 0, 40, seed=5), phone(music, SR, 32, 90, seed=6), 32.0, SR)
-    assert len(eight) == 2 and min(eight) > MIN_SUPPORT  # an 8 s overlap is still cut in two, and holds in both
+    assert len(eight) == 2 and min(eight) > MIN_SUPPORT and holds(eight)  # an 8 s overlap is still cut in two, and holds in both
     six_a, six_b = phone(music, SR, 0, 40, seed=5), phone(music, SR, 34.5, 90, seed=6)  # 5.5 s: too short to cut
     assert support(six_a, six_b, 34.5, SR) is None
 

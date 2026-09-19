@@ -397,3 +397,21 @@ def test_a_sorting_saved_by_an_older_way_of_sorting_is_done_again_from_the_same_
     assert not any("before: using that" in line for line in lines)  # but the sorting was not taken as it was
     assert any("pair(s) of clips were compared before" in line for line in lines)
     assert groups_of(redone) == groups_of(first) == groups_of(again)
+
+
+def test_saved_support_scores_of_an_older_check_are_not_used_but_the_pair_scores_are(tmp_path, calls):
+    import json
+
+    project = project_with(tmp_path, TWO_CONCERTS)
+    first = sync(project)
+    made = len(calls)
+    path = project.root / cache.SAVED / "pairs.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["value"]["support_rev"] == sync_mod.SUPPORT_REVISION
+    data["value"]["support_rev"] = sync_mod.SUPPORT_REVISION - 1  # saved by a check that was not this one ...
+    data["value"]["support"] = [[a, b, [0.0, 0.0, 0.0]] for a, b, _ in data["value"]["support"]]  # ... and would say no to all
+    path.write_text(json.dumps(data), encoding="utf-8")
+    (project.root / cache.SAVED / "sorted.json").unlink()
+    again = sync(project)
+    assert len(calls) == made  # the scores of pairs were used: nothing compared
+    assert groups_of(again) == groups_of(first)  # and what the old check said was not
