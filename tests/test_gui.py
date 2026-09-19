@@ -77,6 +77,7 @@ class FakeYouTube:
         kind = "preview" if project.root.name == "preview" else "video"
         self.calls.append((kind, bool(kw.get("audio_only")), ids, kw.get("max_height")))
         self.kwargs.append(kw)
+        return [{"id": i, "title": self.titles.get(i), "url": f"https://www.youtube.com/watch?v={i}"} for i in ids]
 
     def downloaded(self, kind: str) -> list[str]:
         return [i for k, _, ids, _ in self.calls if k == kind for i in ids]
@@ -117,7 +118,10 @@ def test_pipeline_runs_all_six_stages_and_reports(tmp_path, monkeypatch):
     assert 1.0 < result["minutes"] < 1.4  # the two clips together cover 70 s
     # first small audio-only previews of the candidates, then the videos themselves
     assert [(kind, audio_only) for kind, audio_only, _, _ in yt.calls] == [("preview", True), ("video", False)]
-    assert not (s.project_dir / "preview").exists()  # the previews have done their job
+    # the previews stay (a run of the same search again then needs no downloading or sorting), but not their decoded sound
+    assert (s.project_dir / "preview" / "clips").is_dir() and len(list((s.project_dir / "preview" / "clips").iterdir())) == 2
+    assert (s.project_dir / "preview" / "saved" / "sorted.json").exists()
+    assert not (s.project_dir / "preview" / "cache" / "audio").exists()
 
 
 def test_only_the_chosen_groups_videos_are_downloaded(tmp_path, monkeypatch):
@@ -224,7 +228,7 @@ def test_pipeline_asks_which_group_and_hands_the_answer_to_sync(tmp_path, monkey
     s = Settings("ask me 2024", tmp_path)
     seen = {}
 
-    def fake_sync(project, log, choose):
+    def fake_sync(project, log, choose, **kw):
         seen["index"] = choose([_timeline_of("a1", "a2", "a3"), _timeline_of("b1", "b2", "b3", "b4")])
         raise UserError("stop here")
 
@@ -240,7 +244,7 @@ def test_pipeline_asks_which_group_and_hands_the_answer_to_sync(tmp_path, monkey
     assert seen["index"] == 1 and [o.count for o in shown] == [3, 4]
 
     with pytest.raises(UserError, match="stop here"):  # without a chooser, sync is not given one
-        monkeypatch.setattr(gui, "sync_project", lambda project, log, choose: (_ for _ in ()).throw(UserError(f"stop here {choose}")))
+        monkeypatch.setattr(gui, "sync_project", lambda project, log, choose, **kw: (_ for _ in ()).throw(UserError(f"stop here {choose}")))
         run_pipeline(s, log=lambda *_: None)
 
 
@@ -402,3 +406,159 @@ def test_the_pipeline_shows_the_matching_as_it_happens_and_gives_the_titles(tmp_
         Settings("watched 2024", tmp_path / "p", clips=20, quality=480), log=lambda *_: None, choose_group=lambda options: options[0],
     )
     assert (watched["used"], watched["skipped"]) == (plain["used"], plain["skipped"])
+
+
+# ---- running the same search again
+
+
+class _Log:
+    """The log of runs, and how many comparisons of clips were made in sorting them (the line-up of each downloaded
+    video with its own preview is another matter, and is done every time)."""
+
+    def __init__(self):
+        self.lines = []
+
+    def __call__(self, msg=""):
+        self.lines.append(str(msg))
+
+    @property
+    def compared(self) -> int:
+        return sum(1 for line in self.lines if " vs " in line and ": z=" in line and "comparisons" in line)
+
+
+def test_the_same_search_again_does_not_sort_again_and_another_group_can_be_picked(tmp_path, monkeypatch):
+    yt = FakeYouTube(tmp_path / "youtube")
+    _two_concerts(yt)
+    monkeypatch.setattr(gui, "fetch", yt)
+    log = _Log()
+    s = Settings("two shows 2024", tmp_path, clips=20, quality=480)
+
+    first = run_pipeline(s, log=log, choose_group=lambda options: options[0])
+    sorting = log.compared
+    assert sorting > 0 and first["used"] == 3
+    gui.clean_up_after(s)  # what the window does when a run is over: the videos go, the rest stays
+    assert not (s.project_dir / "clips").exists()
+
+    second = run_pipeline(s, log=log, choose_group=lambda options: options[1])  # the other show this time
+    assert log.compared == sorting  # not sorted again
+    assert any("before: using that" in line for line in log.lines)
+    assert sorted(yt.downloaded("video")) == ["a1", "a2", "a3", "b1", "b2", "b3"]  # each video downloaded once, when chosen
+    assert first["video"].exists() and second["video"].exists() and first["video"] != second["video"]
+    assert 0.9 < second["minutes"] < 1.1  # the 60 s of the second show
+    assert yt.kwargs[0]["remember"] is True and not yt.kwargs[1].get("remember")  # the search is kept; the downloads are not
+
+
+def test_only_what_this_search_found_is_sorted_not_previews_left_by_another_search(tmp_path, monkeypatch):
+    yt = FakeYouTube(tmp_path / "youtube")
+    _two_concerts(yt)
+    s = Settings("two shows 2024", tmp_path, clips=20, quality=480)
+    (s.project_dir / "preview" / "clips").mkdir(parents=True)
+    shutil.copy(yt.folder / "b1.mp4", s.project_dir / "preview" / "clips" / "b1.mp4")  # left by an earlier, bigger search
+
+    def searching(project, urls, queries, **kw):
+        found = yt(project, urls, queries, **kw)
+        return [t for t in found if t["id"] in {"a1", "a2", "a3"}] if queries else found  # this search found only show A
+
+    monkeypatch.setattr(gui, "fetch", searching)
+    result = run_pipeline(s, log=lambda *_: None, choose_group=lambda options: pytest.fail(f"one group only: {options}"))
+    assert sorted(yt.downloaded("video")) == ["a1", "a2", "a3"] and result["used"] == 3
+
+
+def test_a_newer_meld_does_not_use_what_an_older_one_saved(tmp_path, monkeypatch):
+    from meld import cache
+
+    yt = FakeYouTube(tmp_path / "youtube")
+    _one_concert(yt)
+    monkeypatch.setattr(gui, "fetch", yt)
+    log = _Log()
+    s = Settings("test show 2024", tmp_path, clips=20)
+    run_pipeline(s, log=log)
+    sorting = log.compared
+    assert sorting > 0
+    run_pipeline(s, log=log)
+    assert log.compared == sorting and not any("newer Meld" in line for line in log.lines)  # the same Meld: all is used
+
+    monkeypatch.setattr(cache, "__version__", "9.9.9")
+    run_pipeline(s, log=log)
+    assert log.compared == 2 * sorting and any("newer Meld" in line for line in log.lines)  # a new one sorts it again
+    assert len(list((s.project_dir / "preview" / "clips").iterdir())) == 2  # what YouTube sent was not thrown away
+
+
+def test_running_a_search_clears_the_previews_of_the_oldest_searches(tmp_path, monkeypatch):
+    import os
+    import time
+
+    from meld import cache
+
+    for i in range(7):  # seven earlier searches, s0 the newest
+        d = tmp_path / f"s{i}" / "preview"
+        (d / "clips").mkdir(parents=True)
+        (d / "clips" / "x.m4a").write_bytes(b"x")
+        (d / cache.MARKER).write_text("0.1.3", encoding="utf-8")
+        stamp = time.time() - (i + 1) * 3600
+        os.utime(d / cache.MARKER, (stamp, stamp))
+    yt = FakeYouTube(tmp_path / "youtube")
+    _one_concert(yt)
+    monkeypatch.setattr(gui, "fetch", yt)
+    lines = []
+    run_pipeline(Settings("test show 2024", tmp_path, clips=20), log=lines.append)
+    left = sorted(p.name for p in tmp_path.glob("s*") if (p / "preview").exists())
+    assert left == ["s0", "s1", "s2", "s3"]  # this search and four more: five in all
+    assert any("Cleared the saved previews" in line for line in lines)
+
+
+# ---- what is kept when it is over
+
+
+def _finished_search(root: Path) -> Path:
+    """A search folder as a run leaves it: downloaded videos, working files, previews and what was sorted from them."""
+    d = root / "some-search"
+    for sub in ("clips", "cache/audio", "out", "preview/clips", "preview/saved"):
+        (d / sub).mkdir(parents=True)
+    (d / "preview" / "clips" / "vid1.m4a").write_bytes(b"x")
+    (d / "preview" / "saved" / "sorted.json").write_text("{}", encoding="utf-8")
+    (d / "preview" / "sources.json").write_text("{}", encoding="utf-8")
+    (d / "preview" / "meld-version").write_text("0.1.3", encoding="utf-8")
+    (d / "sources.json").write_text(json.dumps({"vid1": {"title": "x"}}), encoding="utf-8")
+    (d / "clips" / "vid1.mp4").write_bytes(b"video")
+    (d / "cache" / "audio" / "vid1.mp4.16000.f32").write_bytes(b"x")
+    (d / "timeline.json").write_text("{}", encoding="utf-8")
+    (d / "meld.log").write_text("log", encoding="utf-8")
+    return d
+
+
+def test_the_videos_are_kept_only_if_asked_and_the_previews_always(tmp_path):
+    d = _finished_search(tmp_path)
+    assert gui.clean_up_after(Settings("some search", tmp_path)) is True  # "keep the downloaded videos" is off
+    assert not (d / "clips").exists() and not (d / "cache").exists() and not (d / "timeline.json").exists()
+    assert (d / "preview" / "clips" / "vid1.m4a").exists() and (d / "preview" / "saved" / "sorted.json").exists()
+    assert (d / "meld.log").exists()  # the log too: it is what to look at if something went wrong
+
+    d = _finished_search(tmp_path / "kept")
+    assert gui.clean_up_after(Settings("some search", tmp_path / "kept", keep_files=True)) is True  # ... and on
+    assert (d / "clips" / "vid1.mp4").exists() and (d / "cache" / "audio" / "vid1.mp4.16000.f32").exists()
+    assert (d / "preview" / "clips" / "vid1.m4a").exists()
+
+
+def test_keeping_the_previews_leaves_the_persons_own_files_and_says_so_if_it_cannot_finish(tmp_path):
+    d = _finished_search(tmp_path)
+    (d / "clips" / "my own recording.mp4").write_bytes(b"x")  # not a download: no id in sources.json
+    assert gui.remove_working_files(d, keep_previews=True) is False  # something that was to go is still there ...
+    assert (d / "clips" / "my own recording.mp4").exists() and not (d / "clips" / "vid1.mp4").exists()  # ... it is theirs
+
+
+def test_removing_everything_still_removes_the_previews_and_what_was_saved(tmp_path):
+    d = _finished_search(tmp_path)
+    assert gui.remove_working_files(d) is True and not d.exists()
+
+
+def test_a_long_log_is_cut_to_its_end_from_a_whole_line(tmp_path):
+    log = tmp_path / "meld.log"
+    log.write_text("".join(f"line {i:06d}\n" for i in range(200_000)), encoding="utf-8")
+    gui.trim_log(log, limit=1_000_000, keep=200_000)
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert 15_000 < len(lines) < 20_000 and lines[-1] == "line 199999" and lines[0].startswith("line ")
+    short = tmp_path / "short.log"
+    short.write_text("a\nb\n", encoding="utf-8")
+    gui.trim_log(short)
+    assert short.read_text(encoding="utf-8") == "a\nb\n"

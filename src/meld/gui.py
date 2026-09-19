@@ -16,7 +16,7 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import ytdlp
+from . import cache, ytdlp
 from .audiofuse import fuse_audio
 from .matchcanvas import MatchCanvas, Theme
 from .fetch import BLOCKED_MESSAGE, LOGIN_BROWSERS, expand_queries, fetch, installed_browsers, is_blocked
@@ -147,13 +147,20 @@ def run_pipeline(s: Settings, log=print, stage=lambda i, name: None, choose_grou
     preview = project.preview()
     wanted = preview_count(s.clips, bool(s.login))
 
+    if any([cache.stamp(project), cache.stamp(preview)]):  # what an older Meld worked out may not be right by this one
+        log("This is a newer Meld than the one that saved this search: working out what was saved again.")
+    for old in cache.trim(s.folder, keep=s.project_dir):
+        log(f"Cleared the saved previews of an older search: {old.name}")
+
     stage(0, STAGES[0])
-    fetch(
+    found = fetch(
         preview, [], expand_queries(s.query),
         limit=max(wanted, 30), min_duration=20, max_duration=900, max_clips=wanted, match_query=s.query,
-        log=log, audio_only=True, login_browser=s.login,
+        log=log, audio_only=True, login_browser=s.login, remember=True,
     )
-    previewed = len(preview.clip_files())
+    # only what this search found: previews left from a bigger search before are not part of it
+    ids = {t["id"] for t in found if t.get("id")} if found else None
+    previewed = len([f for f in preview.clip_files() if ids is None or f.stem in ids])
     if not previewed:
         raise UserError(
             "I couldn't find any matching videos. Try fewer words, for example just the band and the year."
@@ -173,7 +180,8 @@ def run_pipeline(s: Settings, log=print, stage=lambda i, name: None, choose_grou
 
     stage(1, STAGES[1])
     sorted_tl = sync_project(
-        preview, log=log, choose=pick_group if choose_group else None, **({"on_state": watch} if on_match else {}),
+        preview, log=log, choose=pick_group if choose_group else None, remember=True, only=ids,
+        **({"on_state": watch} if on_match else {}),
     )
     if not sorted_tl.clips:
         raise UserError("None of the videos could be lined up with each other, so there is nothing to combine.")
@@ -200,7 +208,11 @@ def run_pipeline(s: Settings, log=print, stage=lambda i, name: None, choose_grou
     log(f"Saving as {stem}")
     final_video = Path(shutil.move(str(video), str(s.folder / f"{stem}.mp4")))
     final_audio = Path(shutil.move(str(project.out_dir / "fused_audio.wav"), str(s.folder / f"{stem}.wav")))
-    shutil.rmtree(preview.root, ignore_errors=True)  # the previews have done their job
+    # The previews stay, with what was worked out from them: running the same search again (to pick another group, say)
+    # then needs no search, no download of previews and no sorting. Only the decoded sound, which is big and quick to
+    # make again, goes; and the videos, by the caller, unless the person asked to keep them.
+    if not s.keep_files:
+        shutil.rmtree(preview.cache_dir / "audio", ignore_errors=True)
     return {
         "video": final_video,
         "audio": final_audio,
@@ -211,12 +223,14 @@ def run_pipeline(s: Settings, log=print, stage=lambda i, name: None, choose_grou
     }
 
 
-def remove_working_files(project_dir: Path) -> bool:
+def remove_working_files(project_dir: Path, keep_previews: bool = False) -> bool:
     """Delete what Meld downloaded and worked out for one search, once the result is safe elsewhere.
 
     Only Meld's own files go: the videos it downloaded (named by YouTube id in sources.json, plus half-finished
-    downloads), the cache, and the timeline/sources/log. Anything else that happens to be in the folder stays.
-    Returns True when the folder itself is gone."""
+    downloads), the cache, and the timeline/sources. Anything else that happens to be in the folder stays.
+    With `keep_previews` the small audio previews and what was worked out from them (see cache.py) stay too, with the
+    log, so that the same search can be run again quickly; the videos, which are the big part, still go.
+    Returns True when everything that was to go is gone (and, without `keep_previews`, the folder itself)."""
     d = Path(project_dir)
     try:
         ids = set(json.loads((d / "sources.json").read_text(encoding="utf-8")))
@@ -227,15 +241,42 @@ def remove_working_files(project_dir: Path) -> bool:
         if f.is_file() and (f.name.split(".")[0] in ids or _PARTIAL.search(f.name)):
             f.unlink(missing_ok=True)
     shutil.rmtree(d / "cache", ignore_errors=True)
-    shutil.rmtree(d / "preview", ignore_errors=True)  # the audio previews, if a run stopped before removing them
-    for name in ("timeline.json", "sources.json", "meld.log"):
+    names = ["timeline.json", "sources.json"]
+    if not keep_previews:
+        shutil.rmtree(d / "preview", ignore_errors=True)  # the audio previews, if a run stopped before removing them
+        shutil.rmtree(d / cache.SAVED, ignore_errors=True)
+        names += ["meld.log", cache.MARKER]
+    for name in names:
         (d / name).unlink(missing_ok=True)
     for folder in (clips, d / "out", d):  # only succeeds while they are empty
         try:
             folder.rmdir()
         except OSError:
             pass
-    return not d.exists()
+    if not keep_previews:
+        return not d.exists()
+    kept = {"preview", "meld.log", cache.MARKER, cache.SAVED}
+    return not any(p for p in d.rglob("*") if p.is_file() and p.relative_to(d).parts[0] not in kept)
+
+
+def clean_up_after(s: Settings) -> bool:
+    """After a run that finished: the downloaded videos go unless the person asked to keep them (they are the big part, and
+    the video and sound that were asked for are safe in the save folder). What is small and slow to get again stays,
+    for the next run of the same search: the audio previews and what was worked out from them (see cache.py).
+    Returns whether everything that was to go is gone."""
+    if s.keep_files:
+        return True
+    return remove_working_files(s.project_dir, keep_previews=True)
+
+
+def trim_log(path: Path, limit: int = 1_000_000, keep: int = 200_000) -> None:
+    """The log of a search is kept from run to run; when it gets long, only the end of it is kept."""
+    try:
+        if path.stat().st_size > limit:
+            data = path.read_bytes()[-keep:]
+            path.write_bytes(data[data.find(b"\n") + 1:])  # from a whole line
+    except OSError:
+        pass
 
 
 _PROGRESS = (
@@ -292,6 +333,14 @@ def save_settings(s: Settings) -> None:
         )
     except OSError:
         pass
+
+
+def format_size(n: float) -> str:
+    """Bytes as people say them: '340 MB', '1.2 GB'."""
+    for unit, size in (("GB", 1e9), ("MB", 1e6)):
+        if n >= size:
+            return f"{n / size:.1f} {unit}" if unit == "GB" and n < 10e9 else f"{n / size:.0f} {unit}"
+    return f"{max(n, 0) / 1e3:.0f} kB"
 
 
 def shorten_path(text: str, limit: int = 56) -> str:
@@ -594,6 +643,26 @@ def main(hook=None) -> None:
 
     ttk.Button(where, text="Change...", style="Small.TButton", cursor="hand2", command=choose_folder).grid(row=0, column=2)
 
+    def saved_searches() -> None:
+        """What Meld keeps in the save folder so that a search run again is quick: say how much, and offer to clear it."""
+        found = cache.searches(Path(folder_var.get()))
+        if not found:
+            messagebox.showinfo(APP_NAME, "Nothing is kept for later in that folder.")
+            return
+        size = sum(cache.folder_size(d / "preview") for d in found)
+        if messagebox.askyesno(
+            APP_NAME,
+            f"So that a search you run again is quick, Meld keeps the small audio previews and what it worked out from "
+            f"them for {len(found)} earlier search{'es' if len(found) != 1 else ''}: {format_size(size)}.\n\n"
+            "Delete them? (The next run of those searches will download and sort them again. Your finished videos, "
+            "and any videos you chose to keep, are not touched.)",
+        ):
+            for d in found:
+                cache.forget(d)
+
+    saved_btn = ttk.Button(where, text="Saved searches...", style="Small.TButton", cursor="hand2", command=saved_searches)
+    saved_btn.grid(row=0, column=3, padx=(px(6), 0))
+
     buttons = ttk.Frame(frm)
     buttons.grid(row=7, column=0, sticky="ew", pady=(px(12), px(12)))
     start_btn = ttk.Button(buttons, text="Start", style="Primary.TButton", cursor="hand2")
@@ -788,10 +857,12 @@ def main(hook=None) -> None:
         cancel_btn.configure(state="normal" if running else "disabled")
         entry.configure(state="disabled" if running else "normal")
         keep_btn.configure(state="disabled" if running else "normal")
+        saved_btn.configure(state="disabled" if running else "normal")
         login_btn.configure(state="disabled" if running else "normal")
 
     def worker(s: Settings) -> None:
         s.project_dir.mkdir(parents=True, exist_ok=True)
+        trim_log(s.project_dir / "meld.log")
         logfile = open(s.project_dir / "meld.log", "a", encoding="utf-8", errors="replace")
 
         def log(msg="") -> None:
@@ -834,13 +905,12 @@ def main(hook=None) -> None:
         finally:
             logfile.close()
         if result is not None:  # a cancelled or failed run keeps its downloads, so trying again is quick
-            if not s.keep_files:  # the log is closed now, so its folder can go too
-                try:
-                    gone = remove_working_files(s.project_dir)
-                except OSError:
-                    gone = False
-                if not gone:
-                    q.put(("log", f"Some working files could not be removed from {s.project_dir}"))
+            try:  # the log is closed now, so it may be trimmed too
+                gone = clean_up_after(s)
+            except OSError:
+                gone = False
+            if not gone:
+                q.put(("log", f"Some working files could not be removed from {s.project_dir}"))
             q.put(("done", result))
 
     def start() -> None:

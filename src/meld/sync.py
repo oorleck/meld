@@ -4,16 +4,19 @@ from __future__ import annotations
 import itertools
 import json
 import math
+import os
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 from scipy.fft import irfft, next_fast_len, rfft
 
+from . import cache
 from .matchview import MatchState
-from .media import audio_cache_path, load_audio, probe
+from .media import MediaInfo, audio_cache_path, load_audio, probe
 from .pool import Comparer, default_workers
 from .project import Project
 from .timeline import ClipEntry, Timeline
@@ -184,6 +187,20 @@ class _Groups:
     def loose(self, name: str) -> bool:
         return len(self.members[self.home[name]]) == 1
 
+    @classmethod
+    def restore(cls, members: list[dict], link: dict) -> "_Groups":
+        """Groups as `saved` (below) wrote them down."""
+        groups = cls()
+        for gid, group in enumerate(members):
+            groups.members[gid] = dict(group)
+            groups.home.update({name: gid for name in group})
+        groups._next = len(members)
+        groups.link = {name: (anchor, z) for name, (anchor, z) in link.items()}
+        return groups
+
+    def saved(self) -> tuple[list[dict], dict]:
+        return [dict(m) for m in self.members.values()], {n: list(v) for n, v in self.link.items()}
+
 
 def estimate_remaining_groups(
     budget: int, seconds_per_sample: float, processed: list[int], pending: list[int], phase1_done: int,
@@ -242,6 +259,7 @@ def _pair(a: str, b: str) -> tuple[str, str]:
 
 def _align_groups(
     audio: dict, min_z: float, min_overlap: float, max_compare: int, log, comparer: Comparer, on_state=None,
+    supports: dict | None = None,
 ) -> tuple[_Groups, dict]:
     """Sort clips into groups that line up with each other, all growing at the same time.
 
@@ -268,6 +286,7 @@ def _align_groups(
     compared = {n: 0 for n in order}  # comparisons each clip has been part of
     best_z = {n: 0.0 for n in order}
 
+    supports = supports if supports is not None else {}  # (a, b) sorted -> scores of `support`; the caller may keep them
     started = time.perf_counter()
     spent = samples = 0.0  # seconds inside correlate(), and the length of the two clips, summed over comparisons
     done = phase1_done = 0
@@ -318,9 +337,10 @@ def _align_groups(
         nonlocal spent, samples, done, phase1_done
         a, b = _pair(u, p)
         emit((u, p, None))  # this pair is being worked out (or waited for, if a worker is already on it)
+        remembered = comparer.is_known(a, b)  # from an earlier run: it costs nothing, and says nothing of the speed
         t = time.perf_counter()
         tried[(a, b)] = comparer.result(a, b)  # waits for it if it is being computed in the background
-        if done:  # the first comparison also pays for starting the workers and for cold caches: not part of the rate
+        if done and not remembered:  # the first one also pays for starting the workers and for cold caches
             spent += time.perf_counter() - t
             samples += len(audio[a]) + len(audio[b])
         done += 1
@@ -354,7 +374,9 @@ def _align_groups(
             if z < min_z or z >= CONFIDENT_Z:
                 checked[(a, b)] = True
             else:
-                scores = support(audio[a], audio[b], lag, AR)
+                if (a, b) not in supports:
+                    supports[(a, b)] = support(audio[a], audio[b], lag, AR)
+                scores = supports[(a, b)]
                 checked[(a, b)] = scores is None or sum(v >= MIN_SUPPORT for v in scores) >= min(SUPPORT_PARTS, len(scores))
         return checked[(a, b)]
 
@@ -596,9 +618,70 @@ def _align_single(audio: dict, min_z: float, min_overlap: float, max_compare: in
     return placed, pending, best_z
 
 
+def _load_clips(files: list[Path], project: Project, min_overlap: float, log):
+    """Decode what each clip sounds like (several at once: it is a program run for each). Returns (audio, paths, infos,
+    rejected): the samples of every clip with audio and long enough, where they are kept, what each is, and why the others
+    were left out."""
+    rejected: list[dict] = []
+    audio: dict[str, np.ndarray] = {}
+    paths: dict[str, str] = {}  # where each clip's decoded audio is kept: the worker processes read it from there
+    infos = {}
+
+    def prepare(f: Path):
+        try:
+            info = probe(f)
+            if not info.has_audio:
+                return f, None, None, "no audio track"
+            return f, info, np.asarray(load_audio(f, project.cache_dir, AR)), None
+        except (subprocess.CalledProcessError, RuntimeError) as e:
+            return f, None, None, f"could not decode: {e}"
+
+    with ThreadPoolExecutor(max_workers=max(1, min(4, os.cpu_count() or 2))) as pool:
+        for f, info, x, problem in pool.map(prepare, files):  # in order, so the answer never depends on the timing
+            if problem is None and len(x) / AR < min_overlap:
+                problem = f"shorter than {min_overlap}s"
+            if problem is not None:
+                rejected.append({"file": f.name, "reason": problem})
+                continue
+            infos[f.name] = info
+            audio[f.name] = x
+            paths[f.name] = str(audio_cache_path(f, project.cache_dir, AR))
+    log(f"Decoded {len(audio)} clip(s) with audio.")
+    return audio, paths, infos, rejected
+
+
+def _remembered_pairs(project: Project, ids: dict[str, int], min_overlap: float):
+    """What an earlier run of this project worked out about pairs of its clips: ({(a, b): (lag, z)}, {(a, b): scores of
+    `support`}, key). Only pairs of clips that are still the very same files (same size) are given back."""
+    key = cache.key_of("pairs", AR, min_overlap)  # what a score means depends on these
+    stored = cache.load(project.root, "pairs", key)
+    known: dict = {}
+    supports: dict = {}
+    if stored:
+        clips = stored["clips"]
+        same = lambda n: n in ids and clips.get(n) == ids[n]  # noqa: E731
+        for a, b, lag, z in stored["pairs"]:
+            if same(a) and same(b):
+                known[(a, b)] = (lag, z)
+        for a, b, scores in stored["support"]:
+            if (a, b) in known:
+                supports[(a, b)] = scores
+    return known, supports, key
+
+
+def _save_pairs(project: Project, key: str, ids: dict[str, int], known: dict, supports: dict) -> None:
+    """Remember the scores worked out, of the clips that are still in the project."""
+    cache.save(project.root, "pairs", key, {
+        "clips": ids,
+        "pairs": [[a, b, lag, z] for (a, b), (lag, z) in known.items() if a in ids and b in ids],
+        "support": [[a, b, sc] for (a, b), sc in supports.items() if (a, b) in known and a in ids and b in ids],
+    })
+
+
 def sync_project(
     project: Project, min_z: float = 10.0, min_overlap: float = 5.0, max_compare: int = 25, log=print,
     clusters: bool = True, cluster: int = 1, choose=None, workers: int | None = None, on_state=None,
+    remember: bool = False, only: set[str] | None = None,
 ) -> Timeline:
     """Line all the clips up. With `clusters` (the default) clips are sorted into groups that line up with each other,
     all at once, so it does not matter which clip is the longest or which concert it is from; the biggest group is
@@ -607,32 +690,32 @@ def sync_project(
     Without `clusters`, one group is grown from the longest clip and everything that does not join it is rejected.
     `workers` is how many comparisons are run at once, in separate processes: None leaves it to the number of cores and
     the size of the job, 1 is one at a time. The result does not depend on it. `on_state(MatchState)`, if given, is
-    called as the matching goes on (from the thread that runs it) to show it as it happens; see matchview.py."""
+    called as the matching goes on (from the thread that runs it) to show it as it happens; see matchview.py.
+
+    `only`, if given, is the ids (file names without the extension) of the clips to use, out of those in the project.
+    `remember` keeps what is worked out in the project (see cache.py), so that the same clips are not sorted twice:
+    the same clips sorted again (e.g. to choose another group) cost nothing, and after a change (more clips, or a run
+    that was stopped) only the pairs of clips not compared before are compared. The result is the same either way."""
     files = project.clip_files()
+    if only is not None:
+        files = [f for f in files if f.stem in only]
     if not files:
         raise SystemExit(f"No media files in {project.clips_dir}")
 
-    rejected: list[dict] = []
+    ids = cache.file_ids(files)
+    sorted_key = cache.key_of("sorted", ids, (min_z, min_overlap, max_compare))
+    saved = cache.load(project.root, "sorted", sorted_key) if remember and clusters else None
+
     audio: dict[str, np.ndarray] = {}
-    paths: dict[str, str] = {}  # where each clip's decoded audio is kept: the worker processes read it from there
-    infos = {}
-    for f in files:
-        try:
-            info = probe(f)
-            if not info.has_audio:
-                rejected.append({"file": f.name, "reason": "no audio track"})
-                continue
-            x = np.asarray(load_audio(f, project.cache_dir, AR))
-        except (subprocess.CalledProcessError, RuntimeError) as e:
-            rejected.append({"file": f.name, "reason": f"could not decode: {e}"})
-            continue
-        if len(x) / AR < min_overlap:
-            rejected.append({"file": f.name, "reason": f"shorter than {min_overlap}s"})
-            continue
-        infos[f.name] = info
-        audio[f.name] = x
-        paths[f.name] = str(audio_cache_path(f, project.cache_dir, AR))
-    log(f"Decoded {len(audio)} clip(s) with audio.")
+    if saved is not None:  # this very sorting was done before: nothing to decode or compare
+        rejected = [dict(r) for r in saved["rejected"]]
+        seconds = {n: c["seconds"] for n, c in saved["clips"].items()}
+        infos = {n: MediaInfo(c["seconds"], True, c["has_video"], c["width"], c["height"]) for n, c in saved["clips"].items()}
+        log(f"Sorted {len(seconds)} clip(s) by their sound before: using that.")
+    else:
+        audio, paths, infos, rejected = _load_clips(files, project, min_overlap, log)
+        seconds = {n: len(x) / AR for n, x in audio.items()}
+    initially_rejected = [dict(r) for r in rejected]
 
     def no_match(name: str, z: float) -> dict:
         return {"file": name, "reason": f"no confident audio match (best z={z:.1f}, need {min_z})"}
@@ -642,7 +725,7 @@ def sync_project(
         shift = min(offsets.values(), default=0.0)
         return [
             ClipEntry(
-                file=n, offset=off - shift, duration=len(audio[n]) / AR,
+                file=n, offset=off - shift, duration=seconds[n],
                 has_video=infos[n].has_video, width=infos[n].width, height=infos[n].height,
                 z=link[n][1], anchor=link[n][0],
             )
@@ -651,32 +734,52 @@ def sync_project(
 
     others: list[list[ClipEntry]] = []
     if clusters:
-        if workers is not None:
-            n_workers = workers
-        else:
-            average = sum(len(x) for x in audio.values()) / max(len(audio), 1)
-            n_workers = default_workers() if len(audio) >= POOL_MIN_CLIPS and average >= POOL_MIN_SECONDS * AR else 1
-        comparer = Comparer(
-            paths, lambda a, b: correlate(audio[a], audio[b], AR, min_overlap=min_overlap), n_workers, AR, min_overlap,
-            on_fallback=lambda why: log(f"  ({why}: carrying on one comparison at a time)"),
-        )
-        if comparer.parallel:
-            log(f"Comparing up to {comparer.workers} clips at a time.")
         last: list[MatchState] = []
-
-        def watch(state: MatchState) -> None:
-            last[:] = [state]
-            on_state(state)
-
-        try:
-            groups, best_z = _align_groups(
-                audio, min_z, min_overlap, max_compare, log, comparer, watch if on_state is not None else None,
+        if saved is not None:
+            groups = _Groups.restore(saved["groups"], saved["link"])
+            best_z = saved["best_z"]
+        else:
+            if workers is not None:
+                n_workers = workers
+            else:
+                average = sum(len(x) for x in audio.values()) / max(len(audio), 1)
+                n_workers = default_workers() if len(audio) >= POOL_MIN_CLIPS and average >= POOL_MIN_SECONDS * AR else 1
+            known: dict = {}
+            supports: dict = {}
+            every = cache.file_ids(project.clip_files())  # scores are kept for the clips still there, not just `only`
+            if remember:
+                known, supports, pairs_key = _remembered_pairs(project, every, min_overlap)
+                if known:
+                    log(f"{len(known)} pair(s) of clips were compared before: not comparing those again.")
+            comparer = Comparer(
+                paths, lambda a, b: correlate(audio[a], audio[b], AR, min_overlap=min_overlap), n_workers, AR, min_overlap,
+                on_fallback=lambda why: log(f"  ({why}: carrying on one comparison at a time)"), known=known,
             )
-        finally:
-            comparer.close()
+            if comparer.parallel:
+                log(f"Comparing up to {comparer.workers} clips at a time.")
+
+            def watch(state: MatchState) -> None:
+                last[:] = [state]
+                on_state(state)
+
+            try:
+                groups, best_z = _align_groups(
+                    audio, min_z, min_overlap, max_compare, log, comparer, watch if on_state is not None else None, supports,
+                )
+            finally:
+                comparer.close()
+                if remember:  # also when it was stopped half way: the next run goes on from here
+                    _save_pairs(project, pairs_key, every, comparer.known, supports)
+            if remember:
+                members, link = groups.saved()
+                cache.save(project.root, "sorted", sorted_key, {
+                    "clips": {n: {"seconds": seconds[n], "has_video": infos[n].has_video, "width": infos[n].width,
+                                  "height": infos[n].height} for n in seconds},
+                    "rejected": initially_rejected, "groups": members, "link": link, "best_z": best_z,
+                })
         ranked = sorted(
             groups.members.values(),
-            key=lambda m: (-len(m), -(max(o + len(audio[n]) / AR for n, o in m.items()) - min(m.values()))),
+            key=lambda m: (-len(m), -(max(o + seconds[n] for n, o in m.items()) - min(m.values()))),
         )
         made = [entries(m, groups.link) for m in ranked]
         pick = 0
@@ -689,9 +792,12 @@ def sync_project(
                 raise SystemExit(f"Only {len(made)} group(s) of clips line up; there is no group {cluster}.")
             pick = cluster - 1
         clips = made[pick] if made else []
-        if on_state is not None and last:  # over: which group is used
+        if on_state is not None:  # over: which group is used
+            base = last[0] if last else MatchState(  # (sorted before: there was nothing to watch, so show the result)
+                durations=seconds, groups=tuple(dict(m) for m in groups.members.values()), phase=2, min_z=min_z,
+            )
             on_state(replace(
-                last[0], current=None, compare=None, pending=(), finished=True, chosen=frozenset(c.file for c in clips),
+                base, current=None, compare=None, pending=(), finished=True, chosen=frozenset(c.file for c in clips),
             ))
         for i, group in enumerate(made):
             if i == pick:

@@ -12,7 +12,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from . import ytdlp
+from . import cache, ytdlp
 from .concerts import group_concerts
 from .media import ffmpeg_exe
 from .project import _PARTIAL, Project
@@ -31,6 +31,7 @@ BLOCKED_WITH_LOGIN_MESSAGE = (
     "YouTube is still refusing downloads, even with the login from your browser. Make sure you are signed in to "
     "YouTube there, wait a few hours, or try another network, such as a phone hotspot."
 )
+SEARCH_MAX_AGE = 7 * 86400  # a saved search is used for this long (seconds): after that YouTube may have new videos
 BLOCK_LIMIT = 6  # this many downloads in a row refused: YouTube is blocking us, so stop asking for the rest
 _BLOCK_MARKERS = ("not a bot", "too many requests", "http error 429")
 
@@ -229,57 +230,75 @@ def fetch(
     choose=None,
     audio_only: bool = False,
     login_browser: str | None = None,
-) -> None:
+    remember: bool = False,
+) -> list[dict]:
     """`choose(concerts)`, if given, is asked which one to use when the results turn out to be from several different
     concerts (see concerts.py): it returns one of them, or None for "use everything", or raises to abort.
     `audio_only` downloads just the sound (a fraction of the size): enough to line clips up, not to cut video.
     `login_browser` (a key of LOGIN_BROWSERS) has the downloads use the YouTube login stored in that browser, which is
     what gets past 'confirm you're not a bot'. It is read once and kept in memory only; downloads then run fewer at a
-    time, with a pause between them."""
+    time, with a pause between them.
+    `remember` keeps what the search found in the project (see cache.py), and uses it again if the same search is made
+    within a week (the same words and limits), so that going through it again does not ask YouTube again. Videos
+    already downloaded are never downloaded twice, whether it is remembered or not.
+    Returns the videos wanted: the same list that is logged, each {id, title, uploader, duration, url}."""
     targets = [{"url": u, "title": None, "id": video_id(u), "uploader": None, "duration": None} for u in urls]
+    memory = remember and not (choose or dry_run)  # asking which concert, or listing what would be dropped, is not repeated
+    search_key = cache.key_of(
+        "search", targets, queries, limit, min_duration, max_duration, max_clips, list(require), match_query, strict,
+        require_date, concert_only,
+    )
+    saved = cache.load(project.root, "search", search_key, SEARCH_MAX_AGE) if memory else None
+
     def run_search(q: str):
         relevance = Relevance.from_query(match_query or q, require_date, concert_only) if strict else None
         return search(q, limit, min_duration, max_duration, require, relevance, log)
 
-    per_query, all_dropped = [], {}
-    if queries:
-        with ThreadPoolExecutor(max_workers=len(queries)) as pool:  # searching is network-bound
-            for kept, dropped in pool.map(run_search, queries):
-                per_query.append(kept)
-                all_dropped.update(dict(dropped))
-    if dry_run and all_dropped:
-        log(f"Dropped {len(all_dropped)} (first 40):")
-        for title, reason in list(all_dropped.items())[:40]:
-            log(f"  x {title}  ({reason})")
-    # Round-robin over the queries so the cap keeps the best hits of each rather than all of the first.
-    for group in itertools.zip_longest(*per_query):
-        targets += [t for t in group if t]
+    if saved is not None:
+        unique = saved
+        log(f"Using the search made before: {len(unique)} video(s). (Nothing is asked of YouTube for it.)")
+    else:
+        per_query, all_dropped = [], {}
+        if queries:
+            with ThreadPoolExecutor(max_workers=len(queries)) as pool:  # searching is network-bound
+                for kept, dropped in pool.map(run_search, queries):
+                    per_query.append(kept)
+                    all_dropped.update(dict(dropped))
+        if dry_run and all_dropped:
+            log(f"Dropped {len(all_dropped)} (first 40):")
+            for title, reason in list(all_dropped.items())[:40]:
+                log(f"  x {title}  ({reason})")
+        # Round-robin over the queries so the cap keeps the best hits of each rather than all of the first.
+        for group in itertools.zip_longest(*per_query):
+            targets += [t for t in group if t]
 
-    seen, unique = set(), []
-    for t in targets:
-        if t["url"] not in seen:
-            seen.add(t["url"])
-            unique.append(t)
+        seen, unique = set(), []
+        for t in targets:
+            if t["url"] not in seen:
+                seen.add(t["url"])
+                unique.append(t)
 
-    # Several nights turn up in one search. Ask which to use before the cap, so the cap fills up from that one.
-    groups = group_concerts(unique) if (choose or dry_run) else None
-    if groups and len(groups.concerts) > 1:
-        log(f"The results are from {len(groups.concerts)} different concerts:")
-        for c in groups.concerts:
-            log(f"  {c.label}: {c.count} videos")
-        picked = choose(groups.concerts) if choose and not dry_run else None
-        if picked is not None:
-            unique = groups.select(unique, picked)
-            log(f"Using {picked.label}: {picked.count} videos, and {len(groups.undecided)} that don't say which concert")
-    if max_clips:
-        unique = unique[:max_clips]
+        # Several nights turn up in one search. Ask which to use before the cap, so the cap fills up from that one.
+        groups = group_concerts(unique) if (choose or dry_run) else None
+        if groups and len(groups.concerts) > 1:
+            log(f"The results are from {len(groups.concerts)} different concerts:")
+            for c in groups.concerts:
+                log(f"  {c.label}: {c.count} videos")
+            picked = choose(groups.concerts) if choose and not dry_run else None
+            if picked is not None:
+                unique = groups.select(unique, picked)
+                log(f"Using {picked.label}: {picked.count} videos, and {len(groups.undecided)} that don't say which concert")
+        if max_clips:
+            unique = unique[:max_clips]
 
+        if memory:
+            cache.save(project.root, "search", search_key, unique)
     for t in unique:
         dur = f"{t['duration']:.0f}s" if t["duration"] else "?"
         log(f"  {dur:>6}  {t['title'] or t['url']}  [{t['uploader'] or ''}]")
     log(f"{len(unique)} unique clip(s) to fetch.")
     if dry_run or not unique:
-        return
+        return unique
 
     opts = {
         "format": "ba/b" if audio_only else f"bv*[height<={max_height}]+ba/b[height<={max_height}]/b",
@@ -357,3 +376,4 @@ def fetch(
             f"Going on with the {ok} that worked.")
     elif blocked:
         log(f"({blocked} of the failures were YouTube asking to confirm you're not a bot.)")
+    return unique

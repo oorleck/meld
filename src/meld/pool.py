@@ -50,10 +50,14 @@ class Comparer:
     def __init__(
         self, paths: dict[str, str], compute: Callable[[str, str], tuple[float, float]], workers: int = 1,
         fs: int = 16000, min_overlap: float = 5.0, on_fallback: Callable[[str], None] | None = None,
+        known: dict[tuple[str, str], tuple[float, float]] | None = None,
     ):
         self.paths, self.compute, self.fs, self.min_overlap = paths, compute, fs, min_overlap
         self.workers = workers if workers >= 2 else 1
         self.on_fallback = on_fallback
+        # Answers from an earlier run (same clips, same settings), and every answer worked out now is added: the caller
+        # keeps the dict, to save it. A comparison that is known is answered at once and never computed.
+        self.known = known if known is not None else {}
         self._pool: ProcessPoolExecutor | None = None
         self._flying: dict[tuple[str, str], Future] = {}
         self._broken = False
@@ -87,11 +91,23 @@ class Comparer:
             pair = next(upcoming, None)
             if pair is None:
                 return
-            if pair not in self._flying:  # one that finished earlier and was not used yet is still good
+            if pair not in self._flying and pair not in self.known:  # one that finished earlier is still good
                 self._submit(pair)
 
+    def is_known(self, a: str, b: str) -> bool:
+        """Whether `result` for this pair costs nothing, because it was worked out on an earlier run."""
+        return (a, b) in self.known
+
     def result(self, a: str, b: str) -> tuple[float, float]:
-        """(lag, z) for the pair: from the background if it was started there, else worked out now."""
+        """(lag, z) for the pair: remembered, or from the background if it was started there, else worked out now."""
+        if (a, b) in self.known:
+            self._flying.pop((a, b), None)
+            return self.known[(a, b)]
+        answer = self._worked_out(a, b)
+        self.known[(a, b)] = answer
+        return answer
+
+    def _worked_out(self, a: str, b: str) -> tuple[float, float]:
         future = self._flying.pop((a, b), None)
         if future is not None:
             try:

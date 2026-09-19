@@ -90,6 +90,12 @@ def _add_sync(p: argparse.ArgumentParser) -> None:
         help="compare N pairs of clips at once, in separate processes (default: automatic, up to 4 for big jobs; "
              "1 = one at a time). The result is the same whatever N is, only the time differs",
     )
+    p.add_argument(
+        "--no-cache", action="store_true",
+        help="do not remember what is worked out about the clips (which belong together, and every pair compared) in "
+             "the project's saved/ folder, and do not use what is remembered from before. By default sorting the same "
+             "clips again costs nothing, and a new clip only costs its own comparisons",
+    )
 
 
 def _add_audio(p: argparse.ArgumentParser) -> None:
@@ -190,7 +196,7 @@ def main(argv: list[str] | None = None) -> None:
 
         sync_project(
             project, args.min_z, args.min_overlap, args.max_compare, _log, not args.no_clusters, args.cluster,
-            workers=args.match_workers,
+            workers=args.match_workers, remember=not args.no_cache,
         )
     if args.cmd in ("audio", "run", "auto"):
         from .audiofuse import fuse_audio

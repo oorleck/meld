@@ -42,16 +42,28 @@ optional desktop one) and shows a personal-use notice. An installed copy can be 
   groups of three or more videos, a "Which group?" window lists them ("Group 1: Cardiff Principality Stadium · 92 min,
   14 videos", ...). **Only the videos of the group you pick are downloaded in full**, up to the number you asked for
   (the longest first); each is then lined up with its preview, which is one comparison per video and not a second sync.
-  With a single group there is nothing to ask. The previews are deleted when the run ends. On the command line,
+  With a single group there is nothing to ask. The previews are kept for the next run of the same search (see below). On the command line,
   `meld auto` still downloads every candidate in full, and `meld fetch --dry-run` lists the concerts it can tell apart
   from the titles.
 - **The video and the sound are saved** straight into `Documents\Meld` (or the folder you choose) as `<name>.mp4` and
   `<name>.wav`. The name is made of the words most of the YouTube titles have in common, for example
   `Coldplay at Wembley Stadium 2022`; if the titles give nothing to go on, it is what you typed. An existing file is
   never overwritten: the next one becomes `<name> (2)`.
-- **Only those two files are kept.** When a run finishes, the downloaded videos and all working files are deleted
-  (only Meld's own; anything else in the folder stays). Turn on **Keep the downloaded videos** to keep them in
-  `<folder>\<search>\`. A run that is cancelled or fails always keeps them, so trying again does not download them again.
+- **The videos are only kept if you ask.** When a run finishes, the downloaded videos and the working files made from
+  them are deleted (only Meld's own; anything else in the folder stays), leaving the finished `.mp4` and `.wav`. Turn on
+  **Keep the downloaded videos** to keep them in `<folder>\<search>\`. A run that is cancelled or fails keeps what it had
+  downloaded, so trying again does not download it again; they go at the end of the next run that finishes.
+- **Running the same search again is quick.** Small things are kept in `<folder>\<search>\` after a run: the audio
+  previews (what YouTube sent, a few MB each) and, in `preview\saved\`, what was worked out from them: which videos the
+  search found (used for a week), how they sort into groups, and the score of every pair of clips compared. So a second run
+  of the same search needs no search, no preview downloads and no sorting, and you can pick another group in the
+  "Which group?" window at once; only the videos of that group are downloaded, as they were deleted. If the search
+  changes a little (more videos asked for, a new upload) only the clips that are new are downloaded and compared, and a
+  run you cancelled goes on where it stopped. The answer is always the one a fresh run would give. What is kept goes with the
+  version of Meld: a newer Meld works out again what an older one saved (the previews are what YouTube sent, and stay). To keep the
+  disk tidy, Meld clears the previews of all but your five most recent searches, and of any not run for 30 days;
+  **Saved searches...** next to the save folder says how much is kept and clears it (kept videos and finished
+  files are never touched). On the command line `meld sync` does the same in the project folder (`--no-cache` turns it off).
 - **Watch the matching.** When the videos start being sorted by their sound, a second window, *Meld - the matching*,
   opens beside the main one (on a small screen the main window slides to the left edge and the new one overlaps only
   its right part, so Start, Cancel and the steps stay visible) and shows it happening. Each group of videos that line
