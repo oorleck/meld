@@ -98,8 +98,20 @@ def _add_audio(p: argparse.ArgumentParser) -> None:
 
 def _add_video(p: argparse.ArgumentParser) -> None:
     p.add_argument("--size", type=_size, default=(1920, 1080), help="output size, e.g. 1280x720")
-    p.add_argument("--min-shot", type=float, default=3.0, help="shortest shot (seconds)")
+    p.add_argument(
+        "--min-shot", type=float, default=None,
+        help="shortest shot in seconds (default 0.9 when cutting to the music, 3 otherwise)",
+    )
     p.add_argument("--max-shot", type=float, default=12.0, help="longest shot (seconds)")
+    p.add_argument(
+        "--no-beats", action="store_true",
+        help="do not cut to the music: cut by picture quality only (by default cuts go on the beats, short shots where "
+             "the music is intense or fast and long ones where it is calm)",
+    )
+    p.add_argument(
+        "--cut-pace", type=float, default=1.0, metavar="P",
+        help="how fast to cut to the music: 2 cuts twice as often, 0.5 half as often (default 1)",
+    )
 
 
 def _add_recon(p: argparse.ArgumentParser) -> None:
@@ -187,7 +199,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.cmd in ("video", "run", "auto"):
         from .videocut import render_video
 
-        render_video(project, args.size, args.min_shot, args.max_shot, log=_log)
+        render_video(
+            project, args.size, args.min_shot, args.max_shot, log=_log, beats=not args.no_beats, pace=args.cut_pace,
+        )
 
 
 if __name__ == "__main__":
