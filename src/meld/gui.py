@@ -19,7 +19,8 @@ from pathlib import Path
 from . import ytdlp
 from .audiofuse import fuse_audio
 from .fetch import expand_queries, fetch
-from .project import Project, slugify
+from .naming import concert_name, unique_stem
+from .project import _PARTIAL, Project, slugify
 from .sync import sync_project
 from .videocut import render_video
 
@@ -34,8 +35,11 @@ STEP_NAMES = ["Find videos", "Line them up", "Mix the sound", "Cut the video"]  
 IDLE_TEXT = "Ready when you are."
 EXAMPLES = ["Metallica 2003", "Coldplay Wembley 16 August 2022"]
 CLIP_CHOICES = [("A few (quickest)", 20), ("A good amount", 100), ("As many as I can find (slow)", 500)]
-QUALITY_CHOICES = [("Full HD (1080p)", 1080), ("Smaller and faster (720p)", 720)]
-MB_PER_CLIP = {720: 30, 1080: 60}  # rough download size, to warn before filling the disk
+QUALITY_CHOICES = [("Full HD (1080p)", 1080), ("Smaller and faster (720p)", 720), ("Smallest files (480p)", 480)]
+# The picture quality caps the download height and is also the size of the finished video.
+OUTPUT_SIZES = {1080: (1920, 1080), 720: (1280, 720), 480: (854, 480)}
+MAX_CONCERTS_SHOWN = 8  # the picker lists this many, biggest first
+MB_PER_CLIP = {480: 15, 720: 30, 1080: 60}  # rough download size, to warn before filling the disk
 
 
 class Cancelled(Exception):
@@ -52,6 +56,7 @@ class Settings:
     folder: Path  # each search gets its own sub-folder in here
     clips: int = 100
     quality: int = 720
+    keep_files: bool = False  # keep the downloaded videos and working files after a successful run
 
     @property
     def project_dir(self) -> Path:
@@ -59,20 +64,34 @@ class Settings:
 
     @property
     def size(self) -> tuple[int, int]:
-        return (1920, 1080) if self.quality >= 1080 else (1280, 720)
+        for height in sorted(OUTPUT_SIZES, reverse=True):  # the biggest size the quality reaches
+            if self.quality >= height:
+                return OUTPUT_SIZES[height]
+        return OUTPUT_SIZES[min(OUTPUT_SIZES)]
 
     def disk_needed_gb(self) -> float:
         return (self.clips * MB_PER_CLIP.get(self.quality, 60) + 1500) / 1024
 
 
-def run_pipeline(s: Settings, log=print, stage=lambda i, name: None) -> dict:
-    """Search, download, line up, mix and cut. Returns {"video", "folder", "minutes", "used", "skipped"}."""
+def picked_titles(project: Project, tl) -> list[str]:
+    """YouTube titles of the videos that ended up on the timeline (not the ones that were rejected)."""
+    try:
+        sources = json.loads(project.sources_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [t for c in tl.clips if (t := sources.get(Path(c.file).stem, {}).get("title"))]
+
+
+def run_pipeline(s: Settings, log=print, stage=lambda i, name: None, choose=None) -> dict:
+    """Search, download, line up, mix and cut. The video and the sound go into `s.folder`, named after the concert.
+    `choose(concerts)` is asked which concert to use when the search finds several. Returns
+    {"video", "audio", "folder", "minutes", "used", "skipped"}."""
     project = Project(s.project_dir)
     stage(0, STAGES[0])
     fetch(
         project, [], expand_queries(s.query),
         limit=max(s.clips, 30), min_duration=20, max_duration=900, max_height=s.quality,
-        max_clips=s.clips, match_query=s.query, log=log,
+        max_clips=s.clips, match_query=s.query, log=log, choose=choose,
     )
     if not project.clip_files():
         raise UserError(
@@ -89,13 +108,45 @@ def run_pipeline(s: Settings, log=print, stage=lambda i, name: None) -> dict:
 
     stage(3, STAGES[3])
     video = render_video(project, size=s.size, log=log)
+
+    stem = unique_stem(s.folder, concert_name(picked_titles(project, tl), fallback=s.query))
+    log(f"Saving as {stem}")
+    final_video = Path(shutil.move(str(video), str(s.folder / f"{stem}.mp4")))
+    final_audio = Path(shutil.move(str(project.out_dir / "fused_audio.wav"), str(s.folder / f"{stem}.wav")))
     return {
-        "video": Path(video),
-        "folder": project.out_dir,
+        "video": final_video,
+        "audio": final_audio,
+        "folder": s.folder,
         "minutes": sum(b - a for a, b in tl.segments()) / 60,
         "used": len(tl.clips),
         "skipped": len(tl.rejected),
     }
+
+
+def remove_working_files(project_dir: Path) -> bool:
+    """Delete what Meld downloaded and worked out for one search, once the result is safe elsewhere.
+
+    Only Meld's own files go: the videos it downloaded (named by YouTube id in sources.json, plus half-finished
+    downloads), the cache, and the timeline/sources/log. Anything else that happens to be in the folder stays.
+    Returns True when the folder itself is gone."""
+    d = Path(project_dir)
+    try:
+        ids = set(json.loads((d / "sources.json").read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        ids = set()
+    clips = d / "clips"
+    for f in clips.iterdir() if clips.is_dir() else ():
+        if f.is_file() and (f.name.split(".")[0] in ids or _PARTIAL.search(f.name)):
+            f.unlink(missing_ok=True)
+    shutil.rmtree(d / "cache", ignore_errors=True)
+    for name in ("timeline.json", "sources.json", "meld.log"):
+        (d / name).unlink(missing_ok=True)
+    for folder in (clips, d / "out", d):  # only succeeds while they are empty
+        try:
+            folder.rmdir()
+        except OSError:
+            pass
+    return not d.exists()
 
 
 _PROGRESS = (
@@ -142,7 +193,10 @@ def load_saved() -> dict:
 def save_settings(s: Settings) -> None:
     try:
         _settings_path().write_text(
-            json.dumps({"folder": str(s.folder), "clips": s.clips, "quality": s.quality, "query": s.query}),
+            json.dumps({
+                "folder": str(s.folder), "clips": s.clips, "quality": s.quality, "query": s.query,
+                "keep": s.keep_files,
+            }),
             encoding="utf-8",
         )
     except OSError:
@@ -203,6 +257,7 @@ def apply_theme(style, px) -> None:
     style.configure("TLabel", background=BG, foreground=TEXT)
     style.configure("Card.TLabel", background=SURFACE)
     style.configure("Title.TLabel", font=("Segoe UI", 26, "bold"))
+    style.configure("Heading.TLabel", font=("Segoe UI", 16, "bold"))
     style.configure("Hint.TLabel", foreground=MUTED)
     style.configure("CardHint.TLabel", background=SURFACE, foreground=MUTED)
     style.configure("Section.TLabel", foreground=MUTED, font=("Segoe UI", 9, "bold"))
@@ -242,17 +297,18 @@ def apply_theme(style, px) -> None:
     )
 
     # Radio buttons drawn as toggle buttons: ttk's own radio dot is a fixed-size bitmap that is tiny on high-DPI screens.
-    style.configure(
-        "Choice.Toolbutton", background=SURFACE2, foreground=TEXT, bordercolor=BORDER, lightcolor=SURFACE2,
-        darkcolor=SURFACE2, focuscolor=SURFACE2, relief="flat", borderwidth=1, padding=(px(14), px(7)),
-        font=("Segoe UI", 11),
-    )
     state_bg = [("selected", SELECTED), ("active", SURFACE3)]
-    style.map(
-        "Choice.Toolbutton", background=state_bg, lightcolor=state_bg, darkcolor=state_bg,
-        bordercolor=[("selected", ACCENT), ("active", MUTED)], foreground=[("selected", ACCENT)],
-        relief=[("selected", "flat"), ("pressed", "flat")],
-    )
+    for name, anchor in (("Choice.Toolbutton", "center"), ("ChoiceRow.Toolbutton", "w")):  # the row one fills a list
+        style.configure(
+            name, background=SURFACE2, foreground=TEXT, bordercolor=BORDER, lightcolor=SURFACE2, darkcolor=SURFACE2,
+            focuscolor=SURFACE2, relief="flat", borderwidth=1, padding=(px(14), px(7)), font=("Segoe UI", 11),
+            anchor=anchor,
+        )
+        style.map(
+            name, background=state_bg, lightcolor=state_bg, darkcolor=state_bg,
+            bordercolor=[("selected", ACCENT), ("active", MUTED)], foreground=[("selected", ACCENT)],
+            relief=[("selected", "flat"), ("pressed", "flat")],
+        )
 
     style.configure(
         "Meld.Horizontal.TProgressbar", troughcolor=SURFACE2, background=ACCENT, bordercolor=SURFACE2,
@@ -354,12 +410,14 @@ def main(hook=None) -> None:
     saved = load_saved()
     q: "queue.Queue[tuple]" = queue.Queue()
     cancel = threading.Event()
+    answers: "queue.Queue" = queue.Queue()  # the picker dialog's answer, for the worker that is waiting for it
     state = {"worker": None, "result": None}
 
     query_var = tk.StringVar(value=saved.get("query", ""))
     clips_var = tk.IntVar(value=saved.get("clips", 100))
     quality_var = tk.IntVar(value=saved.get("quality", 720))
-    folder_var = tk.StringVar(value=saved.get("folder", str(default_folder())))
+    keep_var = tk.BooleanVar(value=bool(saved.get("keep", False)))
+    folder_var =tk.StringVar(value=saved.get("folder", str(default_folder())))
     folder_shown = tk.StringVar(value=shorten_path(folder_var.get()))
     folder_var.trace_add("write", lambda *_: folder_shown.set(shorten_path(folder_var.get())))
     step_var = tk.StringVar(value=IDLE_TEXT)
@@ -445,11 +503,21 @@ def main(hook=None) -> None:
     ttk.Button(where, text="Change...", style="Small.TButton", cursor="hand2", command=choose_folder).grid(row=0, column=2)
 
     buttons = ttk.Frame(frm)
-    buttons.grid(row=7, column=0, sticky="w", pady=(px(12), px(12)))
+    buttons.grid(row=7, column=0, sticky="ew", pady=(px(12), px(12)))
     start_btn = ttk.Button(buttons, text="Start", style="Primary.TButton", cursor="hand2")
     start_btn.pack(side="left")
     cancel_btn = ttk.Button(buttons, text="Cancel", style="Secondary.TButton", cursor="hand2", state="disabled")
     cancel_btn.pack(side="left", padx=px(12))
+
+    # By default only the finished video and sound are kept; this keeps the downloaded videos too.
+    keep_btn = ttk.Checkbutton(buttons, style="Choice.Toolbutton", variable=keep_var, cursor="hand2")
+    keep_btn.pack(side="right")
+
+    def show_keep(*_) -> None:
+        keep_btn.configure(text=("✓ " if keep_var.get() else "") + "Keep the downloaded videos")
+
+    keep_var.trace_add("write", show_keep)
+    show_keep()
 
     # -- progress: four steps, a status line, a bar and the latest detail
     panel, panel_in = card(frm, pad=16)
@@ -488,7 +556,7 @@ def main(hook=None) -> None:
     wrapped.append((detail_label, px(90)))
 
     # -- result: replaces the progress panel when finished, so the window keeps its height
-    result_card, result_in = card(frm, border=ACCENT, pad=16)
+    result_card, result_in = card(frm, border=ACCENT, pad=14)
     result_card.grid(row=8, column=0, sticky="new")
     result_card.grid_remove()
     result_in.columnconfigure(1, weight=1)
@@ -552,6 +620,7 @@ def main(hook=None) -> None:
         start_btn.configure(state="disabled" if running else "normal")
         cancel_btn.configure(state="normal" if running else "disabled")
         entry.configure(state="disabled" if running else "normal")
+        keep_btn.configure(state="disabled" if running else "normal")
 
     def worker(s: Settings) -> None:
         s.project_dir.mkdir(parents=True, exist_ok=True)
@@ -569,8 +638,23 @@ def main(hook=None) -> None:
             log(f"=== {name}")
             q.put(("stage", i, name))
 
+        def choose(concerts):
+            """Ask the window which concert to use, and wait. Returns a Concert, or None for "all of them"."""
+            q.put(("choose", concerts))
+            while True:
+                try:
+                    answer = answers.get(timeout=0.2)
+                except queue.Empty:
+                    if cancel.is_set():
+                        raise Cancelled()
+                    continue
+                if answer == "cancel":
+                    raise Cancelled()
+                return answer
+
+        result = None
         try:
-            q.put(("done", run_pipeline(s, log, stage)))
+            result = run_pipeline(s, log, stage, choose)
         except Cancelled:
             q.put(("cancelled",))
         except BaseException as e:  # noqa: BLE001 - everything must reach the user
@@ -578,6 +662,15 @@ def main(hook=None) -> None:
             q.put(("error", friendly_error(e), traceback.format_exc()))
         finally:
             logfile.close()
+        if result is not None:  # a cancelled or failed run keeps its downloads, so trying again is quick
+            if not s.keep_files:  # the log is closed now, so its folder can go too
+                try:
+                    gone = remove_working_files(s.project_dir)
+                except OSError:
+                    gone = False
+                if not gone:
+                    q.put(("log", f"Some working files could not be removed from {s.project_dir}"))
+            q.put(("done", result))
 
     def start() -> None:
         query = query_var.get().strip()
@@ -585,7 +678,7 @@ def main(hook=None) -> None:
             messagebox.showinfo(APP_NAME, "Please type which concert to look for, for example:  Metallica 2003")
             entry.focus_set()
             return
-        s = Settings(query, Path(folder_var.get()), clips_var.get(), quality_var.get())
+        s = Settings(query, Path(folder_var.get()), clips_var.get(), quality_var.get(), keep_var.get())
         try:
             s.folder.mkdir(parents=True, exist_ok=True)
             free = shutil.disk_usage(s.folder).free / 1024**3
@@ -629,12 +722,90 @@ def main(hook=None) -> None:
         add_log(details)
         messagebox.showerror(APP_NAME, message + "\n\n(Choose \"Show details\" for technical information.)")
 
+    def ask_concert(concerts) -> None:
+        """The search found videos of several concerts: let the user pick one. The answer goes to `answers`."""
+        shown = concerts[:MAX_CONCERTS_SHOWN]
+        earlier_status = step_var.get()
+        step_var.set("Waiting for you to choose a concert")
+
+        win = tk.Toplevel(root)
+        win.withdraw()
+        win.title("Which concert?")
+        win.configure(background=BG)
+        win.transient(root)
+        win.resizable(False, False)
+        if icon:
+            try:
+                win.iconbitmap(str(icon))
+            except tk.TclError:
+                pass
+        body = ttk.Frame(win, padding=(px(26), px(22), px(26), px(18)))
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Which concert?", style="Heading.TLabel").pack(anchor="w")
+        ttk.Label(
+            body, style="Hint.TLabel", justify="left", wraplength=px(540),
+            text=f"The videos I found are from {len(concerts)} different concerts. Pick the one to combine. "
+                 "Videos that don't say which concert they are from are tried too.",
+        ).pack(anchor="w", pady=(px(6), px(14)))
+
+        choice = tk.IntVar(value=0)  # index into `shown`; -1 = all of them
+        for i, c in enumerate(shown):
+            ttk.Radiobutton(
+                body, text=f"{c.label}      {c.count} videos", value=i, variable=choice, style="ChoiceRow.Toolbutton",
+                cursor="hand2",
+            ).pack(fill="x", pady=(0, px(6)))
+        ttk.Radiobutton(
+            body, text="Not sure: use all of them", value=-1, variable=choice, style="ChoiceRow.Toolbutton",
+            cursor="hand2",
+        ).pack(fill="x", pady=(px(6), 0))
+        if len(concerts) > len(shown):
+            ttk.Label(body, style="Hint.TLabel", text=f"({len(concerts) - len(shown)} concerts with fewer videos are not shown)").pack(
+                anchor="w", pady=(px(8), 0)
+            )
+
+        def finish_choice(answer) -> None:
+            answers.put(answer)
+            try:
+                win.grab_release()
+            except tk.TclError:
+                pass
+            win.destroy()
+            step_var.set(earlier_status)
+
+        row = ttk.Frame(body)
+        row.pack(fill="x", pady=(px(18), 0))
+        ttk.Button(
+            row, text="Continue", style="Primary.TButton", cursor="hand2",
+            command=lambda: finish_choice(shown[choice.get()] if choice.get() >= 0 else None),
+        ).pack(side="left")
+        ttk.Button(
+            row, text="Cancel", style="Secondary.TButton", cursor="hand2", command=lambda: finish_choice("cancel"),
+        ).pack(side="left", padx=px(12))
+        win.protocol("WM_DELETE_WINDOW", lambda: finish_choice("cancel"))
+        win.bind("<Escape>", lambda e: finish_choice("cancel"))
+        win.bind("<Return>", lambda e: finish_choice(shown[choice.get()] if choice.get() >= 0 else None))
+
+        win.update_idletasks()  # centre it over the main window, style it, then show it
+        x = root.winfo_rootx() + (root.winfo_width() - win.winfo_reqwidth()) // 2
+        y = root.winfo_rooty() + max(0, (root.winfo_height() - win.winfo_reqheight()) // 3)
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        style_titlebar(win)
+        win.deiconify()
+        try:
+            win.wait_visibility()
+            win.grab_set()  # nothing else in the app to click while it waits
+        except tk.TclError:
+            pass
+        win.focus_force()
+
     def poll() -> None:
         try:
             while True:
                 msg = q.get_nowait()
                 kind = msg[0]
-                if kind == "stage":
+                if kind == "choose":
+                    ask_concert(msg[1])
+                elif kind == "stage":
                     step_var.set(f"Step {msg[1] + 1} of {len(STAGES)}: {msg[2]}")
                     set_step(msg[1])
                     bar.stop()
@@ -658,7 +829,8 @@ def main(hook=None) -> None:
                     detail_var.set("")
                     result_label.configure(
                         text=f"Made a {r['minutes']:.0f}-minute video from {r['used']} phone videos"
-                             + (f" ({r['skipped']} others didn't match and were left out)." if r["skipped"] else ".")
+                             + (f" ({r['skipped']} others didn't match)." if r["skipped"] else ".")
+                             + f"\nSaved as {r['video'].name}"
                     )
                     play_btn.configure(command=lambda p=r["video"]: os.startfile(p))
                     open_btn.configure(command=lambda p=r["folder"]: os.startfile(p))
@@ -745,7 +917,7 @@ def main(hook=None) -> None:
         widgets = {
             "query": query_var, "folder": folder_var, "clips": clips_var, "quality": quality_var,
             "start": start_btn, "step": step_var, "detail": detail_var, "result": result_label, "play": play_btn,
-            "queue": q,
+            "queue": q, "keep": keep_var,
         }
         root.after(300, hook, root, widgets)
     entry.focus_set()
