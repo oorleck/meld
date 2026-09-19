@@ -19,6 +19,28 @@ from .relevance import Relevance
 QUERY_SUFFIXES = ("live", "fan video", "front row", "crowd", "4K", "full song")
 _VIDEO_ID = re.compile(r"(?:[?&]v=|youtu\.be/|/shorts/)([\w-]{11})")
 
+BLOCKED_MESSAGE = (
+    "YouTube is refusing downloads from this connection: it asks to confirm you're not a bot. "
+    "This usually passes after some hours. Trying another network, such as a phone hotspot, often works right away."
+)
+BLOCK_LIMIT = 6  # this many downloads in a row refused: YouTube is blocking us, so stop asking for the rest
+_BLOCK_MARKERS = ("not a bot", "too many requests", "http error 429")
+
+
+def is_blocked(message: str) -> bool:
+    """Whether a yt-dlp error says YouTube is refusing this connection (its 'confirm you're not a bot' check, or rate
+    limiting), as opposed to a video that is private, removed or otherwise unavailable."""
+    text = message.lower()
+    return any(marker in text for marker in _BLOCK_MARKERS)
+
+
+def short_reason(message: str) -> str:
+    """One readable line from a yt-dlp error such as 'ERROR: [youtube] abc123DEF45: Video unavailable'."""
+    lines = message.strip().splitlines()
+    line = re.sub(r"^ERROR:\s*", "", lines[0].strip()) if lines else ""
+    line = re.sub(r"^\[[^\]]+\]\s*(?:[\w-]{11}:\s*)?", "", line)
+    return line[:120] or "unavailable"
+
 
 def video_id(url: str) -> str | None:
     """The YouTube id in a video link, or None."""
@@ -72,11 +94,32 @@ def search(
     return found, dropped
 
 
+class _Errors:
+    """A logger for yt-dlp that keeps its error messages. With `ignoreerrors` it would otherwise print them somewhere
+    nobody looks (the installed app has no console) and go on, leaving only 'it failed'."""
+
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def debug(self, msg) -> None:
+        pass
+
+    info = warning = debug
+
+    def error(self, msg) -> None:
+        self.messages.append(str(msg))
+
+
 def _download(opts: dict, url: str):
+    """The downloaded video's info. Raises with yt-dlp's own message when it fails and says why."""
     yt_dlp = ytdlp.import_yt_dlp()
 
-    with yt_dlp.YoutubeDL(opts) as ydl:  # one instance per thread; they are not safe to share
-        return ydl.extract_info(url, download=True)
+    errors = _Errors()
+    with yt_dlp.YoutubeDL({**opts, "logger": errors}) as ydl:  # one instance per thread; they are not safe to share
+        info = ydl.extract_info(url, download=True)
+    if info is None and errors.messages:
+        raise RuntimeError(errors.messages[-1])
+    return info
 
 
 def fetch(
@@ -167,7 +210,8 @@ def fetch(
         else:
             todo.append(t)
 
-    ok = failed = 0
+    ok = failed = blocked = refused_in_a_row = 0
+    stopped = False
     pool = ThreadPoolExecutor(max_workers=workers)
     try:
         futures = {pool.submit(_download, opts, t["url"]): t for t in todo}
@@ -176,14 +220,25 @@ def fetch(
             try:
                 info = fut.result()
             except Exception as e:  # a single bad video must not stop the batch
-                info, err = None, str(e).splitlines()[0][:120]
+                info, message = None, str(e)
             else:
-                err = "unavailable"
+                message = "unavailable"
             if not info:
                 failed += 1
-                log(f"[{i}/{len(todo)}] FAILED {t['title'] or t['url']} ({err})")
+                if is_blocked(message):
+                    blocked += 1
+                    refused_in_a_row += 1
+                    reason = "YouTube asked to confirm you're not a bot"
+                else:
+                    refused_in_a_row = 0
+                    reason = short_reason(message)
+                log(f"[{i}/{len(todo)}] FAILED {t['title'] or t['url']} ({reason})")
+                if refused_in_a_row >= BLOCK_LIMIT:
+                    stopped = True  # it is not the videos: the rest would be refused too, and each ask makes it worse
+                    break
                 continue
             ok += 1
+            refused_in_a_row = 0
             sources[info["id"]] = {
                 "title": info.get("title"),
                 "uploader": info.get("uploader"),
@@ -196,3 +251,11 @@ def fetch(
         pool.shutdown(wait=True, cancel_futures=True)
         project.sources_path.write_text(json.dumps(sources, indent=2), encoding="utf-8")
     log(f"Downloaded {ok}, failed {failed}. Clips are in {project.clips_dir}")
+    if blocked and not ok and (stopped or blocked == failed):
+        log(BLOCKED_MESSAGE)
+        raise SystemExit(BLOCKED_MESSAGE)  # nothing can come of this run: say why, in words a person can act on
+    if stopped:  # some downloads did work: go on with those rather than throw them away
+        log(f"YouTube started refusing downloads (it asks to confirm you're not a bot), so the rest were skipped. "
+            f"Going on with the {ok} that worked.")
+    elif blocked:
+        log(f"({blocked} of the failures were YouTube asking to confirm you're not a bot.)")

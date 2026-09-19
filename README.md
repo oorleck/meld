@@ -169,6 +169,10 @@ with several phones at similar zoom, so it is left in and checked automatically.
 ## Limitations (v1)
 
 - Assumes constant offsets: phone clock drift over a long clip (tens of ms per 10 min) is not corrected.
+- YouTube sometimes refuses downloads from a connection ("Sign in to confirm you're not a bot"), typically after many
+  requests. Meld says so plainly instead of calling every video unavailable, stops asking after 6 refusals in a row
+  and carries on with whatever did download; if nothing did, the run stops with an explanation. It usually passes after
+  some hours, or on another network (a phone hotspot often works at once). Meld does not use your YouTube login.
 - Clips from different nights of the same tour can sync just as confidently as same-night ones when the show
   plays to backing tracks (seen in testing with Coldplay at Wembley: 17/20/21 Aug clips aligned with the 16 Aug
   ones). `sync` prints each clip's title so you can prune `clips/` and re-run.

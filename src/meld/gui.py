@@ -18,7 +18,7 @@ from pathlib import Path
 
 from . import ytdlp
 from .audiofuse import fuse_audio
-from .fetch import expand_queries, fetch
+from .fetch import BLOCKED_MESSAGE, expand_queries, fetch, is_blocked
 from .naming import concert_name, shared_words, trim_connectors, unique_stem
 from .project import _PARTIAL, Project, slugify
 from .sync import line_up_downloads, sync_project
@@ -236,6 +236,8 @@ def friendly_error(exc: BaseException) -> str:
         return str(exc)
     if isinstance(exc, SystemExit):
         return str(exc.code) if exc.code else "Stopped."
+    if is_blocked(str(exc)):  # e.g. the search itself was refused
+        return BLOCKED_MESSAGE
     text = str(exc).lower()
     if any(w in text for w in ("urlopen", "getaddrinfo", "timed out", "connection", "network", "resolve")):
         return "I couldn't reach the internet. Please check your connection and try again."
