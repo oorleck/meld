@@ -27,18 +27,42 @@ def format_duration(seconds: float) -> str:
 
 
 def estimate_remaining(
-    compared: list[int], most_per_clip: int, avg_seconds: float, per_placed: float | None
-) -> tuple[float | None, float]:
+    pending: list[tuple[int, int]], placed_samples: list[int], most_per_clip: int, seconds_per_sample: float
+) -> tuple[float, float]:
     """Seconds of matching left: (expected, worst case).
 
-    `compared` holds, for each clip still unplaced, how many comparisons it has had. Worst case is every one of them
-    using its full allowance without ever matching. The expected figure assumes the rest need as many comparisons as
-    the clips placed so far did (`per_placed`), or is None until something has been placed.
+    `pending` has (length in samples, comparisons so far) for every clip still unplaced; `placed_samples` the lengths
+    of the placed ones. A clip is compared against every placed clip it has not met yet, longest first, up to
+    `most_per_clip` in all, whether or not it ends up matching. So a clip placed when k clips are already placed costs
+    about min(most_per_clip, k) comparisons, and one that never matches costs min(most_per_clip, final number of
+    placed clips): the cost grows with the placed set, which is why an average over the clips placed so far is far
+    too low early on. `seconds_per_sample` is the measured cost of a comparison per sample of the two clips together.
+
+    Worst case: every pending clip uses its whole allowance. Expected: the share of the clips seen so far that matched
+    (one in two before there is any evidence) says how many clips will be placed in all, and so how many comparisons
+    each of the rest needs.
     """
-    worst = sum(max(0, most_per_clip - c) for c in compared) * avg_seconds
-    if per_placed is None:
-        return None, worst
-    return min(worst, len(compared) * per_placed * avg_seconds), worst
+    if not pending:
+        return 0.0, 0.0
+    top = sorted(placed_samples, reverse=True)[:most_per_clip]  # what every pending clip is compared against
+    mean_placed = sum(top) / len(top)
+    placed = len(placed_samples)
+    clips = placed - 1 + len(pending)  # all clips but the one everything starts from
+    seen = placed - 1 + sum(1 for _, c in pending if c)  # clips that have had at least one chance to match
+    share = placed / (seen + 2)
+    final_placed = min(clips + 1, max(float(placed), 1 + share * clips))
+    to_place = final_placed - placed  # how many of the pending clips will match, on average
+    p_member = to_place / len(pending)
+    as_member = min(most_per_clip, placed + to_place / 2)  # placed on average halfway through the ones to come
+    as_stranger = min(most_per_clip, final_placed)  # never matches: compared against all that end up placed
+
+    worst = expected = 0.0
+    for samples, done in pending:
+        per_comparison = (samples + mean_placed) * seconds_per_sample
+        worst += max(0, most_per_clip - done) * per_comparison
+        left = p_member * max(0.0, as_member - done) + (1 - p_member) * max(0.0, as_stranger - done)
+        expected += left * per_comparison
+    return min(expected, worst), worst
 
 
 def correlate(a, b, fs: int, band=(150.0, 5000.0), min_overlap: float = 5.0) -> tuple[float, float]:
@@ -116,19 +140,17 @@ def sync_project(
 
     started = time.perf_counter()
     spent = 0.0  # seconds inside correlate()
+    samples = 0  # length of the two clips, added up over the comparisons finished: what their cost depends on
     done = 0  # comparisons finished
-    used_by_placed = 0  # comparisons the placed clips needed before they matched
     most_per_clip = min(max_compare, len(order) - 1)
 
     def time_left() -> str:
         if not done:
             return ""
         expected, worst = estimate_remaining(
-            [compared[n] for n in pending], most_per_clip, spent / done,
-            used_by_placed / (len(placed) - 1) if len(placed) > 1 else None,
+            [(len(audio[n]), compared[n]) for n in pending], [len(audio[n]) for n in placed],
+            most_per_clip, spent / samples,
         )
-        if expected is None:
-            return f" | at most {format_duration(worst)} left"
         return f" | ~{format_duration(expected)} left (at most {format_duration(worst)})"
 
     progress = True
@@ -146,6 +168,7 @@ def sync_project(
                     t = time.perf_counter()
                     tried[(u, p)] = correlate(audio[p], audio[u], AR, min_overlap=min_overlap)
                     spent += time.perf_counter() - t
+                    samples += len(audio[p]) + len(audio[u])
                     done += 1
                     log(
                         f"  {u} vs {p}: z={tried[(u, p)][1]:.1f} | {len(placed)}/{len(order)} placed, "
@@ -159,7 +182,6 @@ def sync_project(
                 p, lag, z = best
                 placed[u] = (placed[p][0] + lag, z, p)
                 pending.remove(u)
-                used_by_placed += compared[u]
                 progress = True
                 log(f"  placed {u} at {placed[u][0]:+.3f}s (z={z:.1f}, via {p})")
     log(f"Matching took {format_duration(time.perf_counter() - started)} ({done} comparisons).")
