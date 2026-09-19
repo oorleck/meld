@@ -18,7 +18,13 @@ from .media import ffmpeg_exe
 from .project import _PARTIAL, Project
 from .relevance import Relevance
 
-QUERY_SUFFIXES = ("live", "fan video", "front row", "crowd", "4K", "full song")
+QUERY_SUFFIXES = (
+    "live", "fan video", "front row", "crowd", "4K", "full song",
+    # how the videos wanted describe themselves: phone footage from the audience, as filmed
+    "iPhone footage", "filmed on iPhone", "shot on iPhone", "Samsung phone footage", "smartphone footage",
+    "audience recording", "handheld footage", "live phone recording", "raw footage", "unedited footage",
+)
+SEARCH_WORKERS = 6  # searches made at once: with this many variations, one thread each would be a flood to YouTube
 _VIDEO_ID = re.compile(r"(?:[?&]v=|youtu\.be/|/shorts/)([\w-]{11})")
 
 BLOCKED_MESSAGE = (
@@ -260,7 +266,7 @@ def fetch(
     else:
         per_query, all_dropped = [], {}
         if queries:
-            with ThreadPoolExecutor(max_workers=len(queries)) as pool:  # searching is network-bound
+            with ThreadPoolExecutor(max_workers=min(len(queries), SEARCH_WORKERS)) as pool:  # network-bound
                 for kept, dropped in pool.map(run_search, queries):
                     per_query.append(kept)
                     all_dropped.update(dict(dropped))
