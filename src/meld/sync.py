@@ -148,6 +148,8 @@ def support(a, b, lag: float, fs: int, parts: int = 3, tol: float = 0.1, min_par
 CONFIDENT_Z = 25.0  # a match this strong needs no second opinion (real matches, undisturbed, score above this)
 MIN_SUPPORT = 7.0  # a weaker one must score this in `support` ...
 SUPPORT_PARTS = 2  # ... in this many parts of its overlap (of three). Real overlaps score at least 11 in each, in noise
+SORT_REVISION = 2  # changes when the way clips are put into groups does. A sorting saved by an earlier way is then done
+# again, from the scores of pairs that were saved (they do not depend on it), instead of being used as it is
 MIN_OFFERED = 3  # a group needs at least this many clips to be worth offering as a choice
 LOOSE_PASSES = 2  # how many times the clips that matched nothing get another look
 AHEAD_CLIPS, AHEAD_PAIRS = 3, 1  # idle workers get the likely first comparisons of this many next clips (this many each)
@@ -933,7 +935,7 @@ def sync_project(
         raise SystemExit(f"No media files in {project.clips_dir}")
 
     ids = cache.file_ids(files)
-    sorted_key = cache.key_of("sorted", ids, (min_z, min_overlap, max_compare))
+    sorted_key = cache.key_of("sorted", ids, (min_z, min_overlap, max_compare), SORT_REVISION)
     saved = cache.load(project.root, "sorted", sorted_key) if remember and clusters else None
 
     audio: dict[str, np.ndarray] = {}

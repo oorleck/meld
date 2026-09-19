@@ -379,3 +379,21 @@ def test_comparisons_that_are_new_are_all_shown_as_before(tmp_path, calls):
     sync(project_with(tmp_path, TWO_CONCERTS), log=lines.append)
     shown = [line for line in lines if " vs " in line and ": z=" in line]
     assert len(shown) == len(calls) and not any("from before" in line for line in shown)
+
+
+def test_a_sorting_saved_by_an_older_way_of_sorting_is_done_again_from_the_same_scores(tmp_path, calls, monkeypatch):
+    # what a fix to how clips are put into groups needs: the groups are made again, but no comparison is
+    project = project_with(tmp_path, TWO_CONCERTS)
+    first = sync(project)
+    made = len(calls)
+    lines = []
+    again = sync(project, log=lines.append)
+    assert not any("compared before" in line for line in lines) and any("before: using that" in line for line in lines)
+
+    monkeypatch.setattr(sync_mod, "SORT_REVISION", sync_mod.SORT_REVISION + 1)  # the way of sorting changed
+    lines.clear()
+    redone = sync(project, log=lines.append)
+    assert len(calls) == made  # every score of a pair is still good: nothing compared
+    assert not any("before: using that" in line for line in lines)  # but the sorting was not taken as it was
+    assert any("pair(s) of clips were compared before" in line for line in lines)
+    assert groups_of(redone) == groups_of(first) == groups_of(again)
