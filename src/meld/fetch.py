@@ -10,6 +10,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from . import ytdlp
+from .concerts import group_concerts
 from .media import ffmpeg_exe
 from .project import Project
 from .relevance import Relevance
@@ -87,7 +88,10 @@ def fetch(
     require_date: bool | None = None,
     concert_only: bool = True,
     log=print,
+    choose=None,
 ) -> None:
+    """`choose(concerts)`, if given, is asked which one to use when the results turn out to be from several different
+    concerts (see concerts.py): it returns one of them, or None for "use everything", or raises to abort."""
     targets = [{"url": u, "title": None, "id": None, "uploader": None, "duration": None} for u in urls]
     def run_search(q: str):
         relevance = Relevance.from_query(match_query or q, require_date, concert_only) if strict else None
@@ -112,6 +116,17 @@ def fetch(
         if t["url"] not in seen:
             seen.add(t["url"])
             unique.append(t)
+
+    # Several nights turn up in one search. Ask which to use before the cap, so the cap fills up from that one.
+    groups = group_concerts(unique) if (choose or dry_run) else None
+    if groups and len(groups.concerts) > 1:
+        log(f"The results are from {len(groups.concerts)} different concerts:")
+        for c in groups.concerts:
+            log(f"  {c.label}: {c.count} videos")
+        picked = choose(groups.concerts) if choose and not dry_run else None
+        if picked is not None:
+            unique = groups.select(unique, picked)
+            log(f"Using {picked.label}: {picked.count} videos, and {len(groups.undecided)} that don't say which concert")
     if max_clips:
         unique = unique[:max_clips]
 
