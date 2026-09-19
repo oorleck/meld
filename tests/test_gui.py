@@ -103,6 +103,78 @@ def test_pipeline_names_the_files_after_the_videos_it_used(tmp_path, monkeypatch
     assert second["video"].name == "Test Band Big Arena 2024 (2).mp4" and first["video"].exists()
 
 
+def test_pipeline_uses_the_biggest_group_and_counts_the_other_groups_as_left_out(tmp_path, monkeypatch):
+    s = Settings("two shows 2024", tmp_path, clips=20, quality=480)
+    clips = s.project_dir / "clips"
+    clips.mkdir(parents=True)
+    a, b = synth_music(70, SR), synth_music(70, SR, seed=5)  # two different concerts
+    make_clip(clips / "a1.mp4", phone(a, SR, 0, 45, seed=1), SR, "testsrc2=size=640x360:rate=30")
+    make_clip(clips / "a2.mp4", phone(a, SR, 25, 70, seed=2), SR, "rgbtestsrc=size=640x360:rate=30")
+    make_clip(clips / "b1.mp4", phone(b, SR, 0, 40, seed=3), SR, "testsrc2=size=640x360:rate=30")
+    make_clip(clips / "b2.mp4", phone(b, SR, 20, 60, seed=4), SR, "rgbtestsrc=size=640x360:rate=30")
+    monkeypatch.setattr(gui, "fetch", lambda *a, **k: None)
+    result = run_pipeline(s, log=lambda *_: None)
+    assert result["used"] == 2
+    assert result["skipped"] == 2  # the other concert's two clips line up with each other, but are not used
+    assert 1.0 < result["minutes"] < 1.3  # the 70 s of the first concert, not the 60 s of the second
+
+
+def _timeline_of(*ids):
+    from meld.timeline import ClipEntry, Timeline
+
+    return Timeline([ClipEntry(f"{i}.mp4", k * 100.0, 120.0, True, 1, 1) for k, i in enumerate(ids)])
+
+
+def test_group_rows_name_the_place_that_tells_the_groups_apart(tmp_path):
+    from meld.project import Project
+
+    titles = {
+        "a1": "Oasis - Wonderwall (Live at Principality Stadium, Cardiff 2025)",
+        "a2": "Oasis Cardiff Principality Stadium 2025 Supersonic",
+        "a3": "Oasis live Cardiff 2025 - Principality Stadium - Live Forever",
+        "m1": "Oasis Live 25 Manchester Heaton Park 2025 - Champagne Supernova",
+        "m2": "Oasis - Heaton Park Manchester 2025 Hello",
+        "m3": "Oasis live Heaton Park Manchester 2025 - Slide Away",
+    }
+    project = Project(tmp_path)
+    (tmp_path / "sources.json").write_text(json.dumps({k: {"title": v} for k, v in titles.items()}), encoding="utf-8")
+    first, second = gui.describe_groups(project, [_timeline_of("a1", "a2", "a3"), _timeline_of("m1", "m2", "m3")])
+    # the band and the year are in both groups' titles, so they say nothing about which is which
+    assert first.label.startswith("Group 1: Cardiff") and "Principality" in first.label and "Oasis" not in first.label
+    assert second.label.startswith("Group 2:") and "Manchester" in second.label and "Heaton" in second.label
+    assert first.count == second.count == 3 and "min" in first.label
+
+    bare = gui.describe_groups(Project(tmp_path / "no-titles"), [_timeline_of("x1", "x2", "x3"), _timeline_of("y1", "y2", "y3")])
+    assert [o.label.split(" ")[0:2] for o in bare] == [["Group", "1"], ["Group", "2"]]  # no titles: just numbered
+
+
+def test_pipeline_asks_which_group_and_hands_the_answer_to_sync(tmp_path, monkeypatch):
+    s = Settings("ask me 2024", tmp_path)
+    (s.project_dir / "clips").mkdir(parents=True)
+    (s.project_dir / "clips" / "x.mp4").write_bytes(b"x")  # only has to exist: fetch and sync are stubbed
+    monkeypatch.setattr(gui, "fetch", lambda *a, **k: None)
+    seen = {}
+
+    def fake_sync(project, log, choose):
+        seen["index"] = choose([_timeline_of("a1", "a2", "a3"), _timeline_of("b1", "b2", "b3", "b4")])
+        raise UserError("stop here")
+
+    monkeypatch.setattr(gui, "sync_project", fake_sync)
+    shown = []
+
+    def choose_group(options):
+        shown.extend(options)
+        return options[1]
+
+    with pytest.raises(UserError, match="stop here"):
+        run_pipeline(s, log=lambda *_: None, choose_group=choose_group)
+    assert seen["index"] == 1 and [o.count for o in shown] == [3, 4]
+
+    with pytest.raises(UserError, match="stop here"):  # without a chooser, sync is not given one
+        monkeypatch.setattr(gui, "sync_project", lambda project, log, choose: (_ for _ in ()).throw(UserError(f"stop here {choose}")))
+        run_pipeline(s, log=lambda *_: None)
+
+
 def _fake_working_folder(root: Path) -> Path:
     d = root / "some-search"
     for sub in ("clips", "cache/audio", "out"):

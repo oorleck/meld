@@ -97,7 +97,8 @@ uv run meld fetch -p projects/show -s "artist venue 2024 live" --dry-run
 uv run meld fetch -p projects/show -s "artist venue 2024 live"
 uv run meld fetch -p projects/show https://www.youtube.com/watch?v=...
 
-# 2. align everything on a shared timeline (writes timeline.json, rejects clips that don't match)
+# 2. align everything on a shared timeline (writes timeline.json; clips that line up with each other form a group,
+#    the biggest group is used, the others are listed; --cluster 2 takes the second biggest)
 uv run meld sync -p projects/show
 
 # 3. fused audio  -> out/fused_audio.wav
@@ -110,10 +111,12 @@ uv run meld video -p projects/show --size 1920x1080
 uv run meld run -p projects/show
 ```
 
-Search results are only candidates. The sync step keeps clips whose audio matches the rest and rejects
-the others (listed with a reason in `timeline.json`), so a wide search is fine.
+Search results are only candidates. The sync step sorts the clips into groups that line up with each other (usually
+one group per concert or night) and fuses the biggest; the clips of the other groups are kept in `timeline.json`
+(`other_groups`) and clips that match nothing are listed there with a reason, so a wide search is fine. `--cluster N`
+fuses the N-th biggest group instead, and `--no-clusters` goes back to growing a single group from the longest clip.
 
-The defaults are generous (up to 250 results per query and 500 clips), so a big run downloads a lot. Sync stays tractable because each clip is compared against at most `--max-compare` (default 25) aligned clips, longest first; raise it if clips you expect to match are being rejected.
+The defaults are generous (up to 250 results per query and 500 clips), so a big run downloads a lot. Sync stays tractable because each clip is compared against at most `--max-compare` (default 25) clips that are already sorted, biggest group and longest clips first; raise it if clips you expect to match are being left out.
 
 ## 3D reconstruction (experimental)
 
@@ -141,8 +144,13 @@ with several phones at similar zoom, so it is left in and checked automatically.
 
 ## How it works
 
-- **sync**: GCC-PHAT cross-correlation of the audio. Starts from the longest clip and grows the aligned set;
-  a clip joins when its best correlation peak is `--min-z` standard deviations above the noise.
+- **sync**: GCC-PHAT cross-correlation of the audio. Clips are sorted into groups that line up with each other, all
+  growing at the same time. Longest first, each clip is compared with the clips already sorted (the bigger a group,
+  the more of the clip's comparisons it gets) and joins the group it matches best, when its best correlation peak is
+  `--min-z` standard deviations above the noise; a clip that matches nothing starts a group of its own; a clip that
+  matches two groups is the bridge that makes them one. Clips that matched nothing then get a second look at each
+  other. The biggest group is fused, so it no longer matters which clip is the longest or which concert it is from. In
+  the window, when several groups of three or more clips turn up, you are asked which one to use.
 - **audio**: every 0.5 s block of every clip is scored (clipping, level, agreement with the other clips'
   spectra); the output crossfades toward the best sources instead of summing mics, which would comb-filter.
 - **video**: clips are scored for sharpness and exposure; a greedy editor cuts between angles with a minimum
@@ -156,6 +164,8 @@ with several phones at similar zoom, so it is left in and checked automatically.
 - Clips from different nights of the same tour can sync just as confidently as same-night ones when the show
   plays to backing tracks (seen in testing with Coldplay at Wembley: 17/20/21 Aug clips aligned with the 16 Aug
   ones). `sync` prints each clip's title so you can prune `clips/` and re-run.
+- A group is only as connected as its overlaps: two stretches of the same show that no clip bridges stay separate
+  groups (a clip needs 5 s of overlap), and only one group is fused into a video.
 - 3D reconstruction is experimental and did not work on the real concert footage tried (see above); the fused
   video itself only switches between angles.
 - Downloading from YouTube is against its ToS and concert footage is usually copyrighted; keep it personal.

@@ -19,7 +19,7 @@ from pathlib import Path
 from . import ytdlp
 from .audiofuse import fuse_audio
 from .fetch import expand_queries, fetch
-from .naming import concert_name, unique_stem
+from .naming import concert_name, shared_words, trim_connectors, unique_stem
 from .project import _PARTIAL, Project, slugify
 from .sync import sync_project
 from .videocut import render_video
@@ -82,10 +82,39 @@ def picked_titles(project: Project, tl) -> list[str]:
     return [t for c in tl.clips if (t := sources.get(Path(c.file).stem, {}).get("title"))]
 
 
-def run_pipeline(s: Settings, log=print, stage=lambda i, name: None, choose=None) -> dict:
+@dataclass
+class Option:
+    """One row of the picker dialog: what to show, and how many videos it stands for."""
+
+    label: str
+    count: int
+
+
+def describe_groups(project: Project, groups: list) -> list[Option]:
+    """Rows for groups of clips that line up with each other, biggest first: 'Group 1: <place> · 92 min'. The place is
+    what the titles of that group share and the other groups' titles do not (the band and year are in all of them)."""
+    try:
+        sources = json.loads(project.sources_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        sources = {}
+    titles = [[sources.get(Path(c.file).stem, {}).get("title") or "" for c in g.clips] for g in groups]
+    words = [shared_words([t for t in ts if t]) for ts in titles]
+    # what every group has (the band, the year) says nothing about which is which; only what sets them apart does
+    common = set.intersection(*({w.casefold() for w in ws} for ws in words)) if words else set()
+    options = []
+    for i, (g, ws) in enumerate(zip(groups, words), 1):
+        own = [w for w in ws if w.casefold() not in common and not any(c.isdigit() for c in w)]
+        place = " ".join(trim_connectors(own)[:5])
+        minutes = sum(b - a for a, b in g.segments()) / 60
+        options.append(Option(f"Group {i}" + (f": {place}" if place else "") + f" · {minutes:.0f} min", len(g.clips)))
+    return options
+
+
+def run_pipeline(s: Settings, log=print, stage=lambda i, name: None, choose=None, choose_group=None) -> dict:
     """Search, download, line up, mix and cut. The video and the sound go into `s.folder`, named after the concert.
-    `choose(concerts)` is asked which concert to use when the search finds several. Returns
-    {"video", "audio", "folder", "minutes", "used", "skipped"}."""
+    `choose(concerts)` is asked which concert to use when the search finds several; `choose_group(options)` which group
+    of videos when, once lined up by their sound, there are several worth choosing between (it returns one of the
+    options). Returns {"video", "audio", "folder", "minutes", "used", "skipped"}."""
     project = Project(s.project_dir)
     stage(0, STAGES[0])
     fetch(
@@ -98,8 +127,13 @@ def run_pipeline(s: Settings, log=print, stage=lambda i, name: None, choose=None
             "I couldn't find any matching videos. Try fewer words, for example just the band and the year."
         )
 
+    def pick_group(groups) -> int | None:
+        options = describe_groups(project, groups)
+        answer = choose_group(options)
+        return options.index(answer) if answer is not None else None
+
     stage(1, STAGES[1])
-    tl = sync_project(project, log=log)
+    tl = sync_project(project, log=log, choose=pick_group if choose_group else None)
     if not tl.clips:
         raise UserError("None of the videos could be lined up with each other, so there is nothing to combine.")
 
@@ -119,7 +153,7 @@ def run_pipeline(s: Settings, log=print, stage=lambda i, name: None, choose=None
         "folder": s.folder,
         "minutes": sum(b - a for a, b in tl.segments()) / 60,
         "used": len(tl.clips),
-        "skipped": len(tl.rejected),
+        "skipped": tl.left_out,
     }
 
 
@@ -638,9 +672,9 @@ def main(hook=None) -> None:
             log(f"=== {name}")
             q.put(("stage", i, name))
 
-        def choose(concerts):
-            """Ask the window which concert to use, and wait. Returns a Concert, or None for "all of them"."""
-            q.put(("choose", concerts))
+        def ask(kind: str, items):
+            """Have the window let the user pick one of `items`, and wait. Returns it, or None for "all of them"."""
+            q.put((kind, items))
             while True:
                 try:
                     answer = answers.get(timeout=0.2)
@@ -652,9 +686,15 @@ def main(hook=None) -> None:
                     raise Cancelled()
                 return answer
 
+        def choose(concerts):
+            return ask("choose", concerts)
+
+        def choose_group(options):
+            return ask("choose_group", options)
+
         result = None
         try:
-            result = run_pipeline(s, log, stage, choose)
+            result = run_pipeline(s, log, stage, choose, choose_group)
         except Cancelled:
             q.put(("cancelled",))
         except BaseException as e:  # noqa: BLE001 - everything must reach the user
@@ -722,15 +762,15 @@ def main(hook=None) -> None:
         add_log(details)
         messagebox.showerror(APP_NAME, message + "\n\n(Choose \"Show details\" for technical information.)")
 
-    def ask_concert(concerts) -> None:
-        """The search found videos of several concerts: let the user pick one. The answer goes to `answers`."""
-        shown = concerts[:MAX_CONCERTS_SHOWN]
+    def ask_choice(items, heading: str, blurb: str, hidden: str, allow_all: bool) -> None:
+        """Let the user pick one of `items` (each with a label and a count). The answer goes to `answers`."""
+        shown = items[:MAX_CONCERTS_SHOWN]
         earlier_status = step_var.get()
-        step_var.set("Waiting for you to choose a concert")
+        step_var.set(f"Waiting for you to choose: {heading.rstrip('?').lower()}")
 
         win = tk.Toplevel(root)
         win.withdraw()
-        win.title("Which concert?")
+        win.title(heading)
         win.configure(background=BG)
         win.transient(root)
         win.resizable(False, False)
@@ -741,12 +781,10 @@ def main(hook=None) -> None:
                 pass
         body = ttk.Frame(win, padding=(px(26), px(22), px(26), px(18)))
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text="Which concert?", style="Heading.TLabel").pack(anchor="w")
-        ttk.Label(
-            body, style="Hint.TLabel", justify="left", wraplength=px(540),
-            text=f"The videos I found are from {len(concerts)} different concerts. Pick the one to combine. "
-                 "Videos that don't say which concert they are from are tried too.",
-        ).pack(anchor="w", pady=(px(6), px(14)))
+        ttk.Label(body, text=heading, style="Heading.TLabel").pack(anchor="w")
+        ttk.Label(body, style="Hint.TLabel", justify="left", wraplength=px(540), text=blurb).pack(
+            anchor="w", pady=(px(6), px(14))
+        )
 
         choice = tk.IntVar(value=0)  # index into `shown`; -1 = all of them
         for i, c in enumerate(shown):
@@ -754,12 +792,13 @@ def main(hook=None) -> None:
                 body, text=f"{c.label}      {c.count} videos", value=i, variable=choice, style="ChoiceRow.Toolbutton",
                 cursor="hand2",
             ).pack(fill="x", pady=(0, px(6)))
-        ttk.Radiobutton(
-            body, text="Not sure: use all of them", value=-1, variable=choice, style="ChoiceRow.Toolbutton",
-            cursor="hand2",
-        ).pack(fill="x", pady=(px(6), 0))
-        if len(concerts) > len(shown):
-            ttk.Label(body, style="Hint.TLabel", text=f"({len(concerts) - len(shown)} concerts with fewer videos are not shown)").pack(
+        if allow_all:
+            ttk.Radiobutton(
+                body, text="Not sure: use all of them", value=-1, variable=choice, style="ChoiceRow.Toolbutton",
+                cursor="hand2",
+            ).pack(fill="x", pady=(px(6), 0))
+        if len(items) > len(shown):
+            ttk.Label(body, style="Hint.TLabel", text=f"({len(items) - len(shown)} {hidden} are not shown)").pack(
                 anchor="w", pady=(px(8), 0)
             )
 
@@ -804,7 +843,19 @@ def main(hook=None) -> None:
                 msg = q.get_nowait()
                 kind = msg[0]
                 if kind == "choose":
-                    ask_concert(msg[1])
+                    ask_choice(
+                        msg[1], "Which concert?",
+                        f"The videos I found are from {len(msg[1])} different concerts. Pick the one to combine. "
+                        "Videos that don't say which concert they are from are tried too.",
+                        "concerts with fewer videos", allow_all=True,
+                    )
+                elif kind == "choose_group":
+                    ask_choice(
+                        msg[1], "Which group?",
+                        f"By their sound, the videos fall into {len(msg[1])} groups that don't line up with each other: "
+                        "different concerts, or parts of one that never overlap. Pick the one to combine.",
+                        "groups with fewer videos", allow_all=False,
+                    )
                 elif kind == "stage":
                     step_var.set(f"Step {msg[1] + 1} of {len(STAGES)}: {msg[2]}")
                     set_step(msg[1])

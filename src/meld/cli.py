@@ -69,6 +69,15 @@ def _add_sync(p: argparse.ArgumentParser) -> None:
         "--max-compare", type=int, default=25,
         help="compare each clip against at most this many aligned clips (longest first); higher is slower but finds more",
     )
+    p.add_argument(
+        "--no-clusters", action="store_true",
+        help="grow one group from the longest clip and reject everything else, as before (by default clips are sorted "
+             "into groups that line up with each other, all at once, and the biggest group is used)",
+    )
+    p.add_argument(
+        "--cluster", type=int, default=1, metavar="N",
+        help="fuse the N-th biggest group of clips instead of the biggest (see the list printed by sync)",
+    )
 
 
 def _add_audio(p: argparse.ArgumentParser) -> None:
@@ -154,7 +163,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.cmd in ("sync", "run", "auto"):
         from .sync import sync_project
 
-        sync_project(project, args.min_z, args.min_overlap, args.max_compare, _log)
+        sync_project(
+            project, args.min_z, args.min_overlap, args.max_compare, _log, not args.no_clusters, args.cluster,
+        )
     if args.cmd in ("audio", "run", "auto"):
         from .audiofuse import fuse_audio
 

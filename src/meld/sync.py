@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import time
 
@@ -100,35 +101,284 @@ def correlate(a, b, fs: int, band=(150.0, 5000.0), min_overlap: float = 5.0) -> 
     return float(lags[i]) / fs, z
 
 
-def sync_project(
-    project: Project, min_z: float = 10.0, min_overlap: float = 5.0, max_compare: int = 25, log=print,
-) -> Timeline:
-    files = project.clip_files()
-    if not files:
-        raise SystemExit(f"No media files in {project.clips_dir}")
+CONFIDENT_Z = 25.0  # a match this strong needs no second opinion (real matches score above this, see correlate)
+MIN_OFFERED = 3  # a group needs at least this many clips to be worth offering as a choice
+LOOSE_PASSES = 2  # how many times the clips that matched nothing get another look
 
-    rejected: list[dict] = []
-    audio: dict[str, np.ndarray] = {}
-    infos = {}
-    for f in files:
-        try:
-            info = probe(f)
-            if not info.has_audio:
-                rejected.append({"file": f.name, "reason": "no audio track"})
-                continue
-            x = np.asarray(load_audio(f, project.cache_dir, AR))
-        except (subprocess.CalledProcessError, RuntimeError) as e:
-            rejected.append({"file": f.name, "reason": f"could not decode: {e}"})
-            continue
-        if len(x) / AR < min_overlap:
-            rejected.append({"file": f.name, "reason": f"shorter than {min_overlap}s"})
-            continue
-        infos[f.name] = info
-        audio[f.name] = x
-    log(f"Decoded {len(audio)} clip(s) with audio.")
+# ---------------------------------------------------------------- groups that grow side by side
 
-    # Grow a set of aligned clips outward from the longest one. Each unplaced clip is correlated
-    # against the placed ones and joins if its best match is confident enough.
+
+class _Groups:
+    """Aligned groups of clips. Each group has its own time; a clip's offset is where in it the clip starts."""
+
+    def __init__(self) -> None:
+        self.members: dict[int, dict[str, float]] = {}
+        self.home: dict[str, int] = {}
+        self.link: dict[str, tuple[str | None, float | None]] = {}  # clip -> (clip it was lined up with, z)
+        self._next = 0
+
+    def seed(self, name: str) -> int:
+        gid, self._next = self._next, self._next + 1
+        self.members[gid] = {name: 0.0}
+        self.home[name] = gid
+        self.link[name] = (None, None)
+        return gid
+
+    def add(self, gid: int, name: str, offset: float, anchor: str, z: float) -> None:
+        self.members[gid][name] = offset
+        self.home[name] = gid
+        self.link[name] = (anchor, z)
+
+    def merge(self, into: int, other: int, shift: float) -> None:
+        for name, offset in self.members.pop(other).items():
+            self.members[into][name] = offset + shift
+            self.home[name] = into
+
+    def loose(self, name: str) -> bool:
+        return len(self.members[self.home[name]]) == 1
+
+
+def estimate_remaining_groups(
+    budget: int, seconds_per_sample: float, processed: list[int], pending: list[int], phase1_done: int,
+    loose: list[int], tried_pairs: int, second_look: float | None = None,
+) -> tuple[float, float]:
+    """Seconds of matching left when clips are sorted into groups side by side: (expected, worst case).
+
+    The work has two parts. First every clip, longest first, is compared with up to `budget` clips already sorted; the
+    i-th clip has i to choose from, and how much of that it uses (a clip that joins a group stops early) is learned
+    from the clips done so far (`phase1_done` comparisons for `processed`; lengths are in samples). `pending` are the
+    ones still to do. Then the clips that matched nothing (`loose`) get a second look against everything they have not
+    met. A comparison is shared by the two clips, so this part costs far less than a budget per clip: the first clip
+    compared with the others leaves the next one fewer to do, and so on. Once that part has begun the caller knows
+    exactly what is left of it and passes it as `second_look`. `tried_pairs` is how many pairs are already compared:
+    there are only so many pairs, which caps the worst case. `seconds_per_sample` is the measured cost of a comparison
+    per sample of the two clips together.
+    """
+    done_n, todo_n = len(processed), len(pending)
+    total = done_n + todo_n
+    if total < 2:
+        return 0.0, 0.0
+    biggest = max(processed + pending)
+    pairs_left = max(0, total * (total - 1) // 2 - tried_pairs)
+    ceiling = pairs_left * 2 * biggest * seconds_per_sample  # every pair left, each as dear as the dearest
+    if second_look is not None:  # the first part is over
+        return min(second_look, ceiling), min(second_look * LOOSE_PASSES, ceiling)
+
+    top = sorted(processed, reverse=True)[:budget] or sorted(pending, reverse=True)[:budget]
+    partner = sum(top) / len(top)  # what a clip is compared with tends to be the longer clips
+    everyone = (sum(processed) + sum(pending)) / total
+
+    slots = sum(min(budget, j) for j in range(1, done_n))  # comparisons the clips done so far could have made
+    used_share = min(1.0, (phase1_done + 2.5) / (slots + 5))  # about half before there is any evidence
+    first = first_worst = 0.0
+    for r, samples in enumerate(pending):
+        options = min(budget, done_n + r)
+        cost = (samples + partner) * seconds_per_sample
+        first += used_share * options * cost
+        first_worst += options * cost
+
+    loose_now = len(loose)
+    share = (loose_now + 1) / (done_n + 2)  # of the clips still to do, about this many will match nothing
+    n_loose = int(round(loose_now + share * todo_n))
+    mean_loose = sum(loose) / loose_now if loose_now else everyone
+    outside = max(0.0, total - n_loose - budget)  # partners the first part did not get to
+    second = sum(min(budget, n_loose - 1 - i + outside) for i in range(n_loose))
+    second *= (mean_loose + everyone) * seconds_per_sample
+    second_worst = (loose_now + todo_n) * min(budget, total - 1) * (everyone + partner) * seconds_per_sample * LOOSE_PASSES
+    worst = min(first_worst + second_worst, ceiling)
+    return min(first + second, worst), worst
+
+
+def _pair(a: str, b: str) -> tuple[str, str]:
+    return (a, b) if a < b else (b, a)
+
+
+def _align_groups(audio: dict, min_z: float, min_overlap: float, max_compare: int, log) -> tuple[_Groups, dict]:
+    """Sort clips into groups that line up with each other, all growing at the same time.
+
+    Longest clip first, each clip is compared with the clips already sorted (the bigger a group, the more of the
+    clip's `max_compare` comparisons it gets, longest members first; a match as strong as CONFIDENT_Z ends the search
+    in that group) and:
+    - joins the group it matches best;
+    - seeds a group of its own if it matches nothing;
+    - if it matches two groups, it is the bridge between them: they become one.
+    Clips that matched nothing then get another look, against everything they have not met (a group of two only forms
+    when its clips meet). Returns the groups and the best z each clip reached.
+    """
+    order = sorted(audio, key=lambda n: -len(audio[n]))
+    total = len(order)
+    budget = max(1, min(max_compare, total - 1))
+    groups = _Groups()
+    tried: dict[tuple[str, str], tuple[float, float]] = {}  # (a, b) sorted -> (lag, z): b starts `lag` s after a
+    compared = {n: 0 for n in order}  # comparisons each clip has been part of
+    best_z = {n: 0.0 for n in order}
+
+    started = time.perf_counter()
+    spent = samples = 0.0  # seconds inside correlate(), and the length of the two clips, summed over comparisons
+    done = phase1_done = 0
+    processed: list[str] = []
+    phase = 1
+    retry: list[str] = []  # phase 2: the clips to get another look
+    retried = looking = 0
+    second_total = second_spent0 = 0.0  # phase 2: what this pass was expected to cost, and `spent` when it began
+
+    def time_left() -> str:
+        if not done:
+            return ""
+        lengths = [len(audio[n]) for n in processed]
+        if phase == 1:
+            todo = [len(audio[n]) for n in order[len(processed):]]
+            expected, worst = estimate_remaining_groups(
+                budget, spent / samples, lengths, todo, phase1_done,
+                [len(audio[n]) for n in processed if groups.loose(n)], len(tried),
+            )
+        else:
+            expected, worst = estimate_remaining_groups(
+                budget, spent / samples, lengths, [], phase1_done, [], len(tried),
+                second_look=max(0.0, second_total - (spent - second_spent0)),
+            )
+        return f" | ~{format_duration(expected)} left (at most {format_duration(worst)})"
+
+    def progress() -> str:
+        return f"{len(processed)}/{total} placed" if phase == 1 else f"{retried}/{looking} placed (a second look)"
+
+    def compare(u: str, p: str) -> None:
+        nonlocal spent, samples, done, phase1_done
+        a, b = _pair(u, p)
+        t = time.perf_counter()
+        tried[(a, b)] = correlate(audio[a], audio[b], AR, min_overlap=min_overlap)
+        spent += time.perf_counter() - t
+        samples += len(audio[a]) + len(audio[b])
+        done += 1
+        phase1_done += phase == 1
+        compared[u] += 1
+        compared[p] += 1
+        log(
+            f"  {u} vs {p}: z={tried[(a, b)][1]:.1f} | {progress()}, {done} comparisons, "
+            f"{format_duration(time.perf_counter() - started)} elapsed{time_left()}"
+        )
+
+    def after(u: str, p: str) -> tuple[float, float]:
+        """(lag, z) of the pair, with lag = how many seconds later u starts than p."""
+        a, b = _pair(u, p)
+        lag, z = tried[(a, b)]
+        return (lag if b == u else -lag), z
+
+    def plan(u: str) -> list[tuple[int, int, list[str]]]:
+        """In what order u is compared with the other groups, how many comparisons each may get, and its members."""
+        here = groups.home.get(u)
+        big = sorted((g for g in groups.members if g != here and len(groups.members[g]) > 1),
+                     key=lambda g: -len(groups.members[g]))
+        single = sorted((g for g in groups.members if g != here and len(groups.members[g]) == 1),
+                        key=lambda g: -len(audio[next(iter(groups.members[g]))]))
+        in_big = sum(len(groups.members[g]) for g in big) or 1
+        return [
+            (
+                gid,
+                1 if len(groups.members[gid]) == 1 else max(2, math.ceil(budget * len(groups.members[gid]) / in_big)),
+                sorted(groups.members[gid], key=lambda n: -len(audio[n])),
+            )
+            for gid in big + single
+        ]
+
+    def second_look_seconds(names: list[str]) -> float:
+        """What looking at these clips again will cost if nothing more matches. A comparison is shared by its two
+        clips, so a pair is only paid for once."""
+        counted: set[tuple[str, str]] = set()
+        cost = 0
+        for u in names:
+            used = 0
+            for _, quota, members in plan(u):
+                new = 0
+                for p in members:
+                    key = _pair(u, p)
+                    if key in tried or key in counted:
+                        continue
+                    if new >= quota or used >= budget:
+                        break
+                    counted.add(key)
+                    new += 1
+                    used += 1
+                    cost += len(audio[u]) + len(audio[p])
+                if used >= budget:
+                    break
+        return cost * (spent / samples if samples else 0.0)
+
+    def attach(u: str) -> dict[int, tuple[str, float, float]]:
+        """Compare u with the other groups. Returns, for each group it matches, (member, lag, z) of its best match."""
+        found: dict[int, tuple[str, float, float]] = {}
+        used = 0
+        for gid, quota, members in plan(u):
+            if used >= budget:
+                break
+            if len(members) == 1 and phase == 1 and found:
+                continue  # a clip that has found its group leaves the loose ends to the second look
+            new, best = 0, None
+            for p in members:
+                if _pair(u, p) not in tried:
+                    if new >= quota or used >= budget:
+                        break
+                    compare(u, p)
+                    new += 1
+                    used += 1
+                lag, z = after(u, p)
+                best_z[u] = max(best_z[u], z)
+                if z >= min_z and (best is None or z > best[2]):
+                    best = (p, lag, z)
+                if best and best[2] >= CONFIDENT_Z:
+                    break
+            if best:
+                found[gid] = best
+        return found
+
+    def place(u: str, found: dict[int, tuple[str, float, float]]) -> None:
+        main = max(found, key=lambda g: found[g][2])
+        p, lag, z = found[main]
+        offset = groups.members[main][p] + lag
+        if u in groups.home:  # a loose clip: its one-clip group goes away
+            del groups.members[groups.home.pop(u)]
+        groups.add(main, u, offset, p, z)
+        log(f"  placed {u} at {offset:+.3f}s (z={z:.1f}, via {p})")
+        for gid, (q, lag_q, _) in found.items():
+            if gid != main:  # u lines up with this group too: it is the bridge, and the two groups become one
+                shift = (offset - lag_q) - groups.members[gid][q]
+                groups.merge(main, gid, shift)
+                log(f"  {u} links two groups (via {q}): they are one now")
+
+    for u in order:
+        found = attach(u) if groups.members else {}
+        if found:
+            place(u, found)
+        else:
+            groups.seed(u)
+        processed.append(u)
+
+    phase = 2
+    for _ in range(LOOSE_PASSES):
+        retry = sorted((n for n in order if groups.loose(n)), key=lambda n: -len(audio[n]))
+        if not retry or len(groups.members) < 2:
+            break
+        retried, looking, merged = 0, len(retry), False
+        second_total, second_spent0 = second_look_seconds(retry), spent
+        for u in retry:
+            if groups.loose(u):  # not already taken into a group by a clip that looked before it
+                found = attach(u)
+                if found:
+                    place(u, found)
+                    merged = True
+            retried += 1
+        if not merged:
+            break
+    log(f"Matching took {format_duration(time.perf_counter() - started)} ({done} comparisons).")
+    return groups, best_z
+
+
+# ---------------------------------------------------------------- the original: one group grown from the longest clip
+
+
+def _align_single(audio: dict, min_z: float, min_overlap: float, max_compare: int, log) -> tuple[dict, list, dict]:
+    """Grow one set of aligned clips outward from the longest clip. Each unplaced clip is correlated against the
+    placed ones and joins if its best match is confident enough. Returns (placed, pending, best z per pending clip)."""
     order = sorted(audio, key=lambda n: -len(audio[n]))
     placed: dict[str, tuple[float, float | None, str | None]] = {}
     if order:
@@ -185,20 +435,93 @@ def sync_project(
                 progress = True
                 log(f"  placed {u} at {placed[u][0]:+.3f}s (z={z:.1f}, via {p})")
     log(f"Matching took {format_duration(time.perf_counter() - started)} ({done} comparisons).")
+    return placed, pending, best_z
 
-    for u in pending:
-        rejected.append({"file": u, "reason": f"no confident audio match (best z={best_z[u]:.1f}, need {min_z})"})
 
-    shift = min((v[0] for v in placed.values()), default=0.0)
-    clips = [
-        ClipEntry(
-            file=n, offset=off - shift, duration=len(audio[n]) / AR,
-            has_video=infos[n].has_video, width=infos[n].width, height=infos[n].height,
-            z=z, anchor=anchor,
+def sync_project(
+    project: Project, min_z: float = 10.0, min_overlap: float = 5.0, max_compare: int = 25, log=print,
+    clusters: bool = True, cluster: int = 1, choose=None,
+) -> Timeline:
+    """Line all the clips up. With `clusters` (the default) clips are sorted into groups that line up with each other,
+    all at once, so it does not matter which clip is the longest or which concert it is from; the biggest group is
+    used (`cluster`=2 takes the second biggest, and so on). `choose(groups)`, if given, is asked which one when there
+    are several worth choosing between (each a Timeline); it returns an index into that list, or None for the biggest.
+    Without `clusters`, one group is grown from the longest clip and everything that does not join it is rejected."""
+    files = project.clip_files()
+    if not files:
+        raise SystemExit(f"No media files in {project.clips_dir}")
+
+    rejected: list[dict] = []
+    audio: dict[str, np.ndarray] = {}
+    infos = {}
+    for f in files:
+        try:
+            info = probe(f)
+            if not info.has_audio:
+                rejected.append({"file": f.name, "reason": "no audio track"})
+                continue
+            x = np.asarray(load_audio(f, project.cache_dir, AR))
+        except (subprocess.CalledProcessError, RuntimeError) as e:
+            rejected.append({"file": f.name, "reason": f"could not decode: {e}"})
+            continue
+        if len(x) / AR < min_overlap:
+            rejected.append({"file": f.name, "reason": f"shorter than {min_overlap}s"})
+            continue
+        infos[f.name] = info
+        audio[f.name] = x
+    log(f"Decoded {len(audio)} clip(s) with audio.")
+
+    def no_match(name: str, z: float) -> dict:
+        return {"file": name, "reason": f"no confident audio match (best z={z:.1f}, need {min_z})"}
+
+    def entries(offsets: dict, link: dict) -> list[ClipEntry]:
+        """The clips of one group, with times counted from its first clip."""
+        shift = min(offsets.values(), default=0.0)
+        return [
+            ClipEntry(
+                file=n, offset=off - shift, duration=len(audio[n]) / AR,
+                has_video=infos[n].has_video, width=infos[n].width, height=infos[n].height,
+                z=link[n][1], anchor=link[n][0],
+            )
+            for n, off in sorted(offsets.items(), key=lambda kv: kv[1])
+        ]
+
+    others: list[list[ClipEntry]] = []
+    if clusters:
+        groups, best_z = _align_groups(audio, min_z, min_overlap, max_compare, log)
+        ranked = sorted(
+            groups.members.values(),
+            key=lambda m: (-len(m), -(max(o + len(audio[n]) / AR for n, o in m.items()) - min(m.values()))),
         )
-        for n, (off, z, anchor) in sorted(placed.items(), key=lambda kv: kv[1][0])
-    ]
-    tl = Timeline(clips, rejected)
+        made = [entries(m, groups.link) for m in ranked]
+        pick = 0
+        worth = [i for i, g in enumerate(made) if len(g) >= MIN_OFFERED]
+        if choose is not None and len(worth) >= 2:
+            answer = choose([Timeline(made[i]) for i in worth])
+            pick = worth[answer or 0]
+        elif cluster > 1:
+            if cluster > len(made):
+                raise SystemExit(f"Only {len(made)} group(s) of clips line up; there is no group {cluster}.")
+            pick = cluster - 1
+        clips = made[pick] if made else []
+        for i, group in enumerate(made):
+            if i == pick:
+                continue
+            if len(group) >= 2:
+                others.append(group)
+            else:
+                rejected.append(no_match(group[0].file, best_z[group[0].file]))
+        if len(made) > 1:
+            log("Groups of clips that line up with each other (the fused one is marked):")
+            for i, group in enumerate(made):
+                span = Timeline(group).end / 60
+                log(f"  {'->' if i == pick else '  '} {len(group)} clip(s), {span:.0f} min")
+    else:
+        placed, pending, best_z = _align_single(audio, min_z, min_overlap, max_compare, log)
+        rejected += [no_match(u, best_z[u]) for u in pending]
+        clips = entries({n: v[0] for n, v in placed.items()}, {n: (v[2], v[1]) for n, v in placed.items()})
+
+    tl = Timeline(clips, rejected, others)
     tl.save(project.timeline_path)
 
     titles = {}
@@ -206,9 +529,14 @@ def sync_project(
         sources = json.loads(project.sources_path.read_text("utf-8"))
         titles = {f.name: sources.get(f.stem, {}).get("title") or "" for f in files}
 
-    log(f"\nAligned {len(clips)} clip(s), rejected {len(rejected)}. Timeline: {project.timeline_path}")
+    log(f"\nAligned {len(clips)} clip(s), rejected {len(rejected)}"
+        + (f", {sum(len(g) for g in others)} more in {len(others)} other group(s)" if others else "")
+        + f". Timeline: {project.timeline_path}")
     for c in clips:
         log(f"  {c.offset:9.3f}s  +{c.duration:7.1f}s  {'video' if c.has_video else 'audio'}  {c.file}  {titles.get(c.file, '')}")
+    for n, group in enumerate(others, 2):
+        for c in group:
+            log(f"  group {n}: {c.file}  {titles.get(c.file, '')}")
     for r in rejected:
         log(f"  rejected {r['file']}: {r['reason']}  {titles.get(r['file'], '')}")
     return tl

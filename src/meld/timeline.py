@@ -25,8 +25,18 @@ class ClipEntry:
 
 @dataclass
 class Timeline:
+    """The clips that are fused (`clips`, one aligned group), plus what was left out: clips that matched nothing
+    (`rejected`) and other groups of clips that line up with each other but not with `clips` (`others`, biggest first;
+    another concert, or another part of the same one). Each group has its own time, starting at 0."""
+
     clips: list[ClipEntry] = field(default_factory=list)
     rejected: list[dict] = field(default_factory=list)
+    others: list[list[ClipEntry]] = field(default_factory=list)
+
+    @property
+    def left_out(self) -> int:
+        """How many clips were found but are not used."""
+        return len(self.rejected) + sum(len(g) for g in self.others)
 
     @property
     def end(self) -> float:
@@ -47,10 +57,16 @@ class Timeline:
         return [(a, round((b - a) * OUT_FPS)) for a, b in self.segments()]
 
     def save(self, path: Path) -> None:
-        data = {"version": 1, "clips": [asdict(c) for c in self.clips], "rejected": self.rejected}
+        data = {
+            "version": 2,
+            "clips": [asdict(c) for c in self.clips],
+            "rejected": self.rejected,
+            "other_groups": [[asdict(c) for c in group] for group in self.others],
+        }
         Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     @classmethod
     def load(cls, path: Path) -> "Timeline":
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-        return cls([ClipEntry(**c) for c in data["clips"]], data.get("rejected", []))
+        data = json.loads(Path(path).read_text(encoding="utf-8"))  # version 1 files have no other_groups
+        others = [[ClipEntry(**c) for c in group] for group in data.get("other_groups", [])]
+        return cls([ClipEntry(**c) for c in data["clips"]], data.get("rejected", []), others)
