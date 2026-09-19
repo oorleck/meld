@@ -352,3 +352,30 @@ def test_the_strict_kind_of_matching_reaches_the_filter(tmp_path, monkeypatch):
                         log=lambda *_: None, all_words=strict)
     assert [r.all_words for r in seen] == [False, True]
     assert seen[1].months == {8} and seen[1].words == ["coldplay", "wembley"]
+
+
+# ---- sorted again from what is remembered: quietly
+
+def test_a_sort_redone_from_remembered_scores_is_not_a_replay_of_every_comparison(tmp_path, calls):
+    project = project_with(tmp_path, TWO_CONCERTS)
+    first_lines, again_lines = [], []
+    first = sync(project, log=first_lines.append)
+    compared = lambda ls: [line for line in ls if " vs " in line and ": z=" in line]
+    (project.root / cache.SAVED / "sorted.json").unlink()  # the clips are the same but the sort is asked for again: e.g. a
+    made = len(calls)  # new clip turned up and went again
+    states = []
+    again = sync(project, log=again_lines.append, on_state=states.append)
+    assert len(calls) == made  # nothing computed
+    assert groups_of(again) == groups_of(first)
+    assert 0 < len(compared(again_lines)) < len(compared(first_lines))  # not one line for each of them ...
+    assert len(compared(again_lines)) <= len(TWO_CONCERTS)  # ... one for each clip, so that the progress still moves
+    assert any("(from before)" in line for line in again_lines)
+    assert any("comparisons, " in line and "of them from before" in line for line in again_lines)  # and the summary says so
+    assert len(states) < 2 * len(compared(first_lines))  # nor is the window shown every one of them
+
+
+def test_comparisons_that_are_new_are_all_shown_as_before(tmp_path, calls):
+    lines = []
+    sync(project_with(tmp_path, TWO_CONCERTS), log=lines.append)
+    shown = [line for line in lines if " vs " in line and ": z=" in line]
+    assert len(shown) == len(calls) and not any("from before" in line for line in shown)

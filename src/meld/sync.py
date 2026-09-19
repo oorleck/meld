@@ -290,6 +290,8 @@ def _align_groups(
     started = time.perf_counter()
     spent = samples = 0.0  # seconds inside correlate(), and the length of the two clips, summed over comparisons
     done = phase1_done = 0
+    reused = 0  # comparisons answered from an earlier run
+    last_remembered: list[str | None] = [None]  # the clip whose remembered comparisons are being passed over quietly
     processed: list[str] = []
     phase = 1
     lengths = {n: len(audio[n]) / AR for n in order}  # seconds, for `on_state`
@@ -334,10 +336,16 @@ def _align_groups(
             ))
 
     def compare(u: str, p: str) -> None:
-        nonlocal spent, samples, done, phase1_done
+        nonlocal spent, samples, done, phase1_done, reused
         a, b = _pair(u, p)
-        emit((u, p, None))  # this pair is being worked out (or waited for, if a worker is already on it)
         remembered = comparer.is_known(a, b)  # from an earlier run: it costs nothing, and says nothing of the speed
+        # Sorted again after a change, thousands of comparisons are answered at once from what was found before: logging
+        # and showing each would be a replay of the whole matching. Only the first of each clip is, so the progress moves.
+        quiet = remembered and last_remembered[0] == u
+        last_remembered[0] = u if remembered else None
+        reused += remembered
+        if not quiet:
+            emit((u, p, None))  # this pair is being worked out (or waited for, if a worker is already on it)
         t = time.perf_counter()
         tried[(a, b)] = comparer.result(a, b)  # waits for it if it is being computed in the background
         if done and not remembered:  # the first one also pays for starting the workers and for cold caches
@@ -349,8 +357,11 @@ def _align_groups(
         compared[p] += 1
         z = tried[(a, b)][1]
         doubted = not confirmed(u, p)
+        if quiet:
+            return
         log(
             f"  {u} vs {p}: z={z:.1f}{' (does not hold through the overlap: not a match)' if doubted and z >= min_z else ''}"
+            f"{' (from before)' if remembered else ''}"
             f" | {progress()}, {done} comparisons, {format_duration(time.perf_counter() - started)} elapsed{time_left()}"
         )
         emit((u, p, z), doubted and z >= min_z)
@@ -549,7 +560,10 @@ def _align_groups(
             break
     current = None
     emit()
-    log(f"Matching took {format_duration(time.perf_counter() - started)} ({done} comparisons).")
+    log(
+        f"Matching took {format_duration(time.perf_counter() - started)} ({done} comparisons"
+        + (f", {reused} of them from before" if reused else "") + ")."
+    )
     return groups, best_z
 
 

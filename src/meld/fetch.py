@@ -5,17 +5,19 @@ the rest and rejects everything else, so it is fine to cast a wide net.
 """
 from __future__ import annotations
 
+import glob
 import itertools
 import json
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from . import cache, ytdlp
 from .concerts import group_concerts
 from .media import ffmpeg_exe
-from .project import _PARTIAL, Project
+from .project import _PARTIAL, MEDIA_EXTS, Project
 from .relevance import Relevance
 
 QUERY_SUFFIXES = (
@@ -38,6 +40,8 @@ BLOCKED_WITH_LOGIN_MESSAGE = (
     "YouTube there, wait a few hours, or try another network, such as a phone hotspot."
 )
 SEARCH_MAX_AGE = 7 * 86400  # a saved search is used for this long (seconds): after that YouTube may have new videos
+DOWNLOAD_TRIES = 3  # a download that fails half way is tried this many times in all ...
+DOWNLOAD_RETRY_PAUSE = 4  # ... with this many seconds' pause (times the number of tries so far) between
 BLOCK_LIMIT = 6  # this many downloads in a row refused: YouTube is blocking us, so stop asking for the rest
 _BLOCK_MARKERS = ("not a bot", "too many requests", "http error 429")
 
@@ -197,23 +201,46 @@ class _Errors:
         self.messages.append(str(msg))
 
 
+def _finished(opts: dict, info: dict) -> bool:
+    """Is there a finished file for the video `info` describes, where the download was to put it?"""
+    try:
+        folder = Path(opts["outtmpl"]).parent
+    except (KeyError, TypeError):
+        return False
+    return any(
+        p.suffix.lower() in MEDIA_EXTS and not _PARTIAL.search(p.name)
+        for p in folder.glob(f"{glob.escape(str(info.get('id') or '?'))}.*")
+    )
+
+
 def _download(opts: dict, url: str):
-    """The downloaded video's info. Raises with yt-dlp's own message when it fails and says why."""
+    """The downloaded video's info. Raises with yt-dlp's own message when it fails and says why.
+
+    yt-dlp is run to go on after errors (`ignoreerrors`), and when the download itself fails half way (a network error;
+    YouTube throttles now and then) it reports the error and returns what it knew of the video all the same, with no
+    file. That is not a download. It is tried again, up to DOWNLOAD_TRIES times, and if there is still no file it raises
+    with the reason, so that it is counted as failed and tried again next time, not sorted as if it were there."""
     yt_dlp = ytdlp.import_yt_dlp()
 
     opts = dict(opts)
     cookies = opts.pop("_meld_cookies", None)  # the login, read once by fetch(): not once per video
-    errors = _Errors()
-    try:
-        with yt_dlp.YoutubeDL({**opts, "logger": errors}) as ydl:  # one per thread; they are not safe to share
-            if cookies is not None:
-                ydl.cookiejar = cookies
-            info = ydl.extract_info(url, download=True)
-    except Exception as e:  # noqa: BLE001 - the reason it gave the logger is the useful one
-        raise RuntimeError(errors.messages[-1] if errors.messages else str(e)) from e
-    if info is None and errors.messages:
-        raise RuntimeError(errors.messages[-1])
-    return info
+    for attempt in range(1, DOWNLOAD_TRIES + 1):
+        errors = _Errors()
+        try:
+            with yt_dlp.YoutubeDL({**opts, "logger": errors}) as ydl:  # one per thread; they are not safe to share
+                if cookies is not None:
+                    ydl.cookiejar = cookies
+                info = ydl.extract_info(url, download=True)
+        except Exception as e:  # noqa: BLE001 - the reason it gave the logger is the useful one
+            raise RuntimeError(errors.messages[-1] if errors.messages else str(e)) from e
+        if info is None and errors.messages:
+            raise RuntimeError(errors.messages[-1])
+        if info is None or not errors.messages or _finished(opts, info):
+            return info
+        message = errors.messages[-1]  # went on after an error, and there is no file
+        if is_blocked(message) or attempt == DOWNLOAD_TRIES:  # a refusal is not cured by asking again at once
+            raise RuntimeError(message)
+        time.sleep(DOWNLOAD_RETRY_PAUSE * attempt)
 
 
 def fetch(
