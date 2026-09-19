@@ -19,6 +19,7 @@ from .matchview import MatchState
 from .media import MediaInfo, audio_cache_path, load_audio, probe
 from .pool import Comparer, default_workers
 from .project import Project
+from .relevance import dates_conflict, title_dates
 from .timeline import ClipEntry, Timeline
 
 AR = 16000  # analysis sample rate
@@ -156,11 +157,13 @@ def holds(scores: list[float]) -> bool:
 CONFIDENT_Z = 25.0  # a match this strong needs no second opinion (real matches, undisturbed, score above this)
 MIN_SUPPORT = 6.0  # a weaker one must score this in a window of its overlap (`support`) ...
 SUPPORT_SHARE = 0.6  # ... in this share of the windows (`holds`)
+DATE_OVERRIDE_Z = 300.0  # clips whose titles name different days are not put in one group, unless they match as well as
+# this: the very same recording, uploaded again with another date in its title
 SUPPORT_REVISION = 2  # changes when `support` does: the scores of it that were saved are then worked out again
 IDENTICAL_Z = 100.0  # two clips that match this well are one recording, however many copies of it there are (what real
 # phones, at different places, do not reach). A false match is a property of the two recordings, not of a clip: every
 # copy of the one has it, and so agrees with a clip that joins wrongly. Only clips that are not copies can confirm it.
-SORT_REVISION = 3  # changes when the way clips are put into groups does. A sorting saved by an earlier way is then done
+SORT_REVISION = 4  # changes when the way clips are put into groups does. A sorting saved by an earlier way is then done
 # again, from the scores of pairs that were saved (they do not depend on it), instead of being used as it is
 MIN_OFFERED = 3  # a group needs at least this many clips to be worth offering as a choice
 LOOSE_PASSES = 2  # how many times the clips that matched nothing get another look
@@ -446,7 +449,7 @@ def _pair(a: str, b: str) -> tuple[str, str]:
 
 def _align_groups(
     audio: dict, min_z: float, min_overlap: float, max_compare: int, log, comparer: Comparer, on_state=None,
-    supports: dict | None = None,
+    supports: dict | None = None, dates: dict | None = None,
 ) -> tuple[_Groups, dict]:
     """Sort clips into groups that line up with each other, all growing at the same time.
 
@@ -460,6 +463,10 @@ def _align_groups(
     group that is there at the same time agrees with it (`others_agree`); a clip that only such a match ties to a group
     is not placed in it. A weak match that carries a cluster in is the worst thing that can happen: one clip of another
     night did, and five more of its night followed it in.
+    `dates` (clip -> the days its title names, see relevance.title_dates) keeps nights apart: a show that plays to backing
+    tracks sounds the same every night, and clips of different nights match each other as well as clips of one. Clips whose
+    titles name different days are not put in one group, however well they match (unless it is a copy of the same recording,
+    DATE_OVERRIDE_Z), and a group is not joined to one that names another day. A clip whose title names no day is free.
     Clips that matched nothing then get another look, against everything they have not met (a group of two only forms
     when its clips meet). Last, with everything known, every cluster that hangs on a weak link is checked again as a
     whole (`audit_groups`): what was believable early on may not be once more clips are there to say. Returns the groups
@@ -694,7 +701,7 @@ def _align_groups(
                     used += 1
                 lag, z = after(u, p)
                 best_z[u] = max(best_z[u], z)
-                if z >= min_z and confirmed(u, p) and (best is None or z > best[2]):
+                if z >= min_z and confirmed(u, p) and not conflict(u, p, z) and (best is None or z > best[2]):
                     best = (p, lag, z)
                 if best and best[2] >= CONFIDENT_Z:
                     break
@@ -727,6 +734,20 @@ def _align_groups(
                 return True
         return False
 
+    dates = dates or {}
+
+    def conflict(a: str, b: str, z: float) -> bool:
+        """Do the titles of these two clips name different days (and they are not the very same recording)?"""
+        return z < DATE_OVERRIDE_Z and dates_conflict(dates.get(a, []), dates.get(b, []))
+
+    def group_days(gid: int) -> list:
+        """The days the titles of the clips of a group name. They agree, but for a copy of a recording with another day in
+        its title (DATE_OVERRIDE_Z), which a group then has two of: a clip conflicts with the group if its day is none of them."""
+        days: list = []
+        for m in groups.members[gid]:
+            days.extend(dates.get(m, []))
+        return days
+
     def copies_of(name: str) -> set[str]:
         """`name` and every clip that is the same recording as it (matches it with IDENTICAL_Z or more, or matches one that does)."""
         seen, todo = {name}, [name]
@@ -752,9 +773,14 @@ def _align_groups(
     def place(u: str, found: dict[int, tuple[str, float, float]]) -> bool:
         """Put u in the group it matches best, and join the others it matches into it, but only on matches that are to be
         believed. Returns whether u was placed."""
-        good = {gid: e for gid, e in found.items() if believable(u, gid, e)}
-        for gid, (p, _, z) in found.items():
-            if gid not in good:
+        good = {}
+        for gid, e in found.items():
+            p, _, z = e
+            if dates and dates_conflict(dates.get(u, []), group_days(gid)) and z < DATE_OVERRIDE_Z:
+                log(f"  {u}: its title names another day than those of that group: not placed there")
+            elif believable(u, gid, e):
+                good[gid] = e
+            else:
                 log(f"  {u}: its match with {p} (z={z:.1f}) is not backed up by anything else in the group: not placed there")
         if not good:
             return False
@@ -766,6 +792,9 @@ def _align_groups(
         groups.add(main, u, offset, p, z)
         log(f"  placed {u} at {offset:+.3f}s (z={z:.1f}, via {p})")
         for gid, (q, lag_q, z_q) in good.items():
+            if gid != main and dates and dates_conflict(group_days(main), group_days(gid)):
+                log(f"  {u} matches another group too, but the titles of the two name different days: they are not joined")
+                continue
             if gid != main:  # u lines up with this group too: it is the bridge, and the two groups become one
                 shift = (offset - lag_q) - groups.members[gid][q]
                 groups.merge(main, gid, shift, bridge=(u, q, z_q))
@@ -942,7 +971,7 @@ def _save_pairs(project: Project, key: str, ids: dict[str, int], known: dict, su
 def sync_project(
     project: Project, min_z: float = 10.0, min_overlap: float = 5.0, max_compare: int = 25, log=print,
     clusters: bool = True, cluster: int = 1, choose=None, workers: int | None = None, on_state=None,
-    remember: bool = False, only: set[str] | None = None,
+    remember: bool = False, only: set[str] | None = None, nights: bool = False,
 ) -> Timeline:
     """Line all the clips up. With `clusters` (the default) clips are sorted into groups that line up with each other,
     all at once, so it does not matter which clip is the longest or which concert it is from; the biggest group is
@@ -956,15 +985,31 @@ def sync_project(
     `only`, if given, is the ids (file names without the extension) of the clips to use, out of those in the project.
     `remember` keeps what is worked out in the project (see cache.py), so that the same clips are not sorted twice:
     the same clips sorted again (e.g. to choose another group) cost nothing, and after a change (more clips, or a run
-    that was stopped) only the pairs of clips not compared before are compared. The result is the same either way."""
+    that was stopped) only the pairs of clips not compared before are compared. The result is the same either way.
+
+    `nights` reads the days the titles of the clips name (from the project's sources.json) and keeps nights apart: clips
+    whose titles name different days are not put in one group (see _align_groups)."""
     files = project.clip_files()
     if only is not None:
         files = [f for f in files if f.stem in only]
     if not files:
         raise SystemExit(f"No media files in {project.clips_dir}")
 
+    dates: dict[str, list] = {}
+    if nights and project.sources_path.exists():
+        try:
+            sources = json.loads(project.sources_path.read_text("utf-8"))
+        except (OSError, ValueError):
+            sources = {}
+        for f in files:
+            named = title_dates(sources.get(f.stem, {}).get("title") or "")
+            if named:
+                dates[f.name] = named
+
     ids = cache.file_ids(files)
-    sorted_key = cache.key_of("sorted", ids, (min_z, min_overlap, max_compare), SORT_REVISION)
+    sorted_key = cache.key_of(
+        "sorted", ids, (min_z, min_overlap, max_compare), SORT_REVISION, sorted((n, repr(d)) for n, d in dates.items()),
+    )
     saved = cache.load(project.root, "sorted", sorted_key) if remember and clusters else None
 
     audio: dict[str, np.ndarray] = {}
@@ -1005,6 +1050,9 @@ def sync_project(
             else:
                 average = sum(len(x) for x in audio.values()) / max(len(audio), 1)
                 n_workers = default_workers() if len(audio) >= POOL_MIN_CLIPS and average >= POOL_MIN_SECONDS * AR else 1
+            if dates:
+                log(f"{len(dates)} of {len(files)} clip(s) name a day in their title: clips that name different days are not put "
+                    f"in one group.")
             known: dict = {}
             supports: dict = {}
             every = cache.file_ids(project.clip_files())  # scores are kept for the clips still there, not just `only`
@@ -1026,6 +1074,7 @@ def sync_project(
             try:
                 groups, best_z = _align_groups(
                     audio, min_z, min_overlap, max_compare, log, comparer, watch if on_state is not None else None, supports,
+                    dates,
                 )
             finally:
                 comparer.close()

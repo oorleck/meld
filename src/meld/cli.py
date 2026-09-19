@@ -97,6 +97,12 @@ def _add_sync(p: argparse.ArgumentParser) -> None:
              "1 = one at a time). The result is the same whatever N is, only the time differs",
     )
     p.add_argument(
+        "--ignore-dates", action="store_true",
+        help="do not use the days the titles of the clips name (from the project's sources.json). By default clips whose "
+             "titles name different days are not put in one group: a show that plays to backing tracks sounds the same every "
+             "night, and clips of different nights would be lined up as one",
+    )
+    p.add_argument(
         "--no-cache", action="store_true",
         help="do not remember what is worked out about the clips (which belong together, and every pair compared) in "
              "the project's saved/ folder, and do not use what is remembered from before. By default sorting the same "
@@ -209,7 +215,7 @@ def main(argv: list[str] | None = None) -> None:
 
         sync_project(
             project, args.min_z, args.min_overlap, args.max_compare, _log, not args.no_clusters, args.cluster,
-            workers=args.match_workers, remember=not args.no_cache,
+            workers=args.match_workers, remember=not args.no_cache, nights=not args.ignore_dates,
         )
     if args.cmd in ("audio", "run", "auto"):
         from .audiofuse import fuse_audio

@@ -228,9 +228,14 @@ with several phones at similar zoom, so it is left in and checked automatically.
   and carries on with whatever did download; if nothing did, the run stops with an explanation. It usually passes after
   some hours, or on another network (a phone hotspot often works at once), or with the optional YouTube login above.
   Meld only uses a login if you choose one.
-- Clips from different nights of the same tour can sync just as confidently as same-night ones when the show
-  plays to backing tracks (seen in testing with Coldplay at Wembley: 17/20/21 Aug clips aligned with the 16 Aug
-  ones). `sync` prints each clip's title so you can prune `clips/` and re-run.
+- Clips from different nights of the same tour sync just as confidently as same-night ones when the show plays to backing
+  tracks (seen with Coldplay at Wembley: 17/20/21 Aug clips aligned with the 16 Aug ones, and with Taylor Swift's Eras
+  Tour, where 9 of 15 groups mixed nights). The sound alone cannot tell them apart, so Meld also reads the days the titles
+  name (`21|6|2024`, `August 20th 2024`, `20.8.24` ...) and does not put clips whose titles name different days in one
+  group, however well they match (unless one is a copy of the same recording, which matches far better than phones do).
+  A clip whose title names no day is free to join any night, and a wrong date in a title keeps a clip out of its group:
+  `--ignore-dates` on `sync` turns this off. On a real Eras Tour search this took the groups that mixed nights from 9 to
+  0 and lost no pair of clips from one night. The group list shows the night when the titles of a group name one.
 - A group is only as connected as its overlaps: two stretches of the same show that no clip bridges stay separate
   groups (a clip needs 5 s of overlap), and only one group is fused into a video.
 - 3D reconstruction is experimental and did not work on the real concert footage tried (see above); the fused

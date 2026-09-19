@@ -40,8 +40,8 @@ _MONTH_RE = "|".join(sorted(_MONTH_NUM, key=len, reverse=True))
 CONNECTORS = {"the", "a", "an", "at", "in", "of", "on", "and", "de", "la", "el", "los", "en"}  # never worth requiring
 STOP = CONNECTORS | {"live", "concert", "show", "tour", "video", "fan", "hd", "full", "song"}  # ... nor, usually, these
 
-_ISO = re.compile(r"(?<![\d./-])(\d{4})[./-](\d{1,2})[./-](\d{1,2})(?!\d)")
-_NUM = re.compile(r"(?<![\d./-])(\d{1,2})[./-](\d{1,2})(?:[./-](\d{4}|\d{2}))?(?![\d])")
+_ISO = re.compile(r"(?<![\d./|-])(\d{4})[./|-](\d{1,2})[./|-](\d{1,2})(?!\d)")  # (a | as well: 21|6|2024 is a date in titles)
+_NUM = re.compile(r"(?<![\d./|-])(\d{1,2})[./|-](\d{1,2})(?:[./|-](\d{4}|\d{2}))?(?![\d])")
 _DMY = re.compile(
     rf"\b(\d{{1,2}})(?:st|nd|rd|th|er|o)?\.?\s*(?:of\s+|de\s+|del\s+)?({_MONTH_RE})\b\.?(?:\s*,?\s*(\d{{4}}))?"
 )
@@ -128,6 +128,17 @@ def find_years(text: str) -> set[int]:
 
 def _same_day(a: Date, b: Date) -> bool:
     return any(d1 == d2 and m1 == m2 and (y1 is None or y2 is None or y1 == y2) for d1, m1, y1 in a for d2, m2, y2 in b)
+
+
+def title_dates(title: str) -> list[Date]:
+    """The days a title names, each as its list of readings (see `find_dates`); [] if it names none. A month or a year
+    alone is not a day."""
+    return find_dates(title)[0]
+
+
+def dates_conflict(a: list[Date], b: list[Date]) -> bool:
+    """Do the days two titles name differ? Only if both name some, and no day of the one is a day of the other."""
+    return bool(a and b) and not any(_same_day(x, y) for x in a for y in b)
 
 
 @dataclass

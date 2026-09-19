@@ -122,9 +122,24 @@ def describe_groups(project: Project, groups: list) -> list[Option]:
     for i, (g, ws) in enumerate(zip(groups, words), 1):
         own = [w for w in ws if w.casefold() not in common and not any(c.isdigit() for c in w)]
         place = " ".join(trim_connectors(own)[:5])
+        night = group_night([t for t in titles[i - 1] if t])
         minutes = sum(b - a for a, b in g.segments()) / 60
-        options.append(Option(f"Group {i}" + (f": {place}" if place else "") + f" · {minutes:.0f} min", len(g.clips)))
+        options.append(Option(
+            f"Group {i}" + (f": {night}" if night else "") + (f"{' · ' if night else ': '}{place}" if place else "")
+            + f" · {minutes:.0f} min", len(g.clips),
+        ))
     return options
+
+
+def group_night(titles: list[str]) -> str:
+    """The day the titles of a group name ('20 Aug 2024'), if they name one and all name the same; else ''."""
+    from .relevance import dates_conflict, title_dates
+
+    named = [d for d in (title_dates(t) for t in titles) if d]
+    if not named or any(dates_conflict(named[0], other) for other in named[1:]):
+        return ""
+    day, month, year = named[0][0][0]
+    return f"{day} {['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][month - 1]}" + (f" {year}" if year else "")
 
 
 def load_titles(project: Project) -> dict[str, str]:
@@ -182,7 +197,7 @@ def run_pipeline(s: Settings, log=print, stage=lambda i, name: None, choose_grou
 
     stage(1, STAGES[1])
     sorted_tl = sync_project(
-        preview, log=log, choose=pick_group if choose_group else None, remember=True, only=ids,
+        preview, log=log, choose=pick_group if choose_group else None, remember=True, only=ids, nights=True,
         **({"on_state": watch} if on_match else {}),
     )
     if not sorted_tl.clips:
