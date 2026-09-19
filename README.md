@@ -201,9 +201,13 @@ with several phones at similar zoom, so it is left in and checked automatically.
   once in a hundred comparisons, while separate processes gave exactly the one-at-a-time answers every time.
 - **audio**: every 0.5 s block of every clip is scored (clipping, level, agreement with the other clips'
   spectra); the output crossfades toward the best sources instead of summing mics, which would comb-filter.
-- **video**: clips are scored for sharpness and exposure; a greedy editor cuts between angles with a minimum
-  and maximum shot length. Vertical clips are fitted over a blurred background. Cuts land on exact frame
-  boundaries so picture stays locked to the audio.
+- **video**: clips are scored for sharpness and exposure. Where the sound has a beat, cuts go on the beats (a couple
+  of frames early) and the shot length follows the music: about 0.8 s where it is loud and driving, up to about 4 s where
+  it is calm, shorter still at a fast tempo, so a typical song is cut about every 1.7 s. Where there is no beat (a ballad,
+  a crowd singing) a greedy editor cuts between angles in shots of 2 to 5 s. Either way the angle is chosen by picture
+  quality, never the same one twice running. `--cut-pace 2` cuts twice as often, `0.5` half as often, `--min-shot` and
+  `--max-shot` set the limits, and `--no-beats` cuts by picture quality only. Vertical clips are fitted over a blurred
+  background. Cuts land on exact frame boundaries so picture stays locked to the audio.
 - Time nobody recorded is skipped in both audio and video.
 
 ## Limitations (v1)

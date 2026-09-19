@@ -9,8 +9,11 @@ frame boundaries so that picture stays locked to the fused audio:
   to end on the first beat of a bar. Which angle is shown is chosen per shot, by picture quality, never the same one twice
   running if there is another to show.
 - Otherwise (no beat, or asked not to): a greedy editor walks the timeline in 0.5 s steps, staying on the current angle
-  until a clearly better one is available (never cutting faster than min_shot, never staying longer than max_shot) and
-  avoiding angles it just used.
+  until a clearly better one is available (never cutting faster than min_shot, never staying longer than max_shot: by
+  default 2 and 5 seconds, so that there is a rhythm of cuts even where the music gives none) and avoiding angles it just
+  used.
+
+`pace` scales both: 2 cuts twice as often, 0.5 half as often.
 """
 from __future__ import annotations
 
@@ -31,9 +34,16 @@ AN = 256
 
 # cutting to the music
 MIN_CONFIDENCE = 0.25  # below this there is no beat to speak of (talk, applause, noise): cut by picture quality instead
-MUSIC_MIN_SHOT = 0.9  # the shortest shot when cutting to the music, seconds
+MUSIC_MIN_SHOT = 0.7  # the shortest shot when cutting to the music, seconds
+MUSIC_MAX_SHOT = 12.0  # the longest
 LEAD = 0.06  # cut this long before the beat: a cut just ahead of the beat reads as on it (about two frames)
-SHOT_INTENSE, SHOT_CALM = 1.5, 9.0  # the shot length aimed at, seconds, for the most intense and the calmest music
+# The shot length aimed at, seconds, for the most intense and the calmest music. Measured on real concert audio, (1.5, 9)
+# gave a shot about every 3 s (18 to 20 cuts a minute) and this gives one about every 1.7 s (35 to 38 a minute): twice as
+# many cuts, in shots of 1.4 to 1.6 s at the median and under 3 s for nine in ten. Any faster starts to strobe.
+SHOT_INTENSE, SHOT_CALM = 0.8, 4.0
+# Where there is no beat (a ballad, a crowd singing) shots run between these, seconds, unless asked for otherwise. They
+# used to be 3 and 12, and with little to tell the angles apart most shots ran to the longest: 13 s at the median.
+PLAIN_MIN_SHOT, PLAIN_MAX_SHOT = 2.0, 5.0
 TEMPO_EXPONENT = 0.7  # how much a fast tempo shortens shots and a slow one lengthens them: shot length goes as tempo to this power
 BEATS_PER_SHOT = {  # how many beats a shot may last, and how much less musical each is (a beat, half a bar, a bar, two
     # bars are; three, six and twelve not quite; the rest are awkward, but a shot of an odd number of beats is what puts
@@ -106,6 +116,15 @@ def plan_segment(S, entries, vidx, t0, t1, min_shot, max_shot, margin, variety):
     if s_hi > cur_start:
         shots.append((cur_start, s_hi, cur))
     return shots
+
+
+def shot_limits(min_shot, max_shot, pace: float = 1.0, music: bool = True) -> tuple[float, float]:
+    """(the shortest, the longest) shot in seconds: as given, else the defaults of the way of cutting. Without a beat the
+    defaults are divided by `pace`, so that 2 cuts twice as often there too."""
+    if music:
+        return (MUSIC_MIN_SHOT if min_shot is None else min_shot), (MUSIC_MAX_SHOT if max_shot is None else max_shot)
+    pace = max(pace, 1e-3)
+    return (PLAIN_MIN_SHOT / pace if min_shot is None else min_shot), (PLAIN_MAX_SHOT / pace if max_shot is None else max_shot)
 
 
 def target_shot(energy: float, rise: float, bpm: float, pace: float = 1.0) -> float:
@@ -282,11 +301,12 @@ def find_beats(project: Project, tl: Timeline, audio_path, log=print) -> list:
 
 
 def render_video(
-    project: Project, size=(1920, 1080), min_shot=None, max_shot=12.0, margin=0.15, variety=0.8, log=print,
+    project: Project, size=(1920, 1080), min_shot=None, max_shot=None, margin=0.15, variety=0.8, log=print,
     beats=True, pace=1.0,
 ):
     """`beats`: cut to the music where there is a beat (else by picture quality only). `pace` above 1 cuts faster, below
-    1 slower. `min_shot` is the shortest shot: 0.9 s when cutting to the music, 3 s otherwise, unless given."""
+    1 slower. `min_shot` is the shortest shot, and `max_shot` the longest: 0.7 and 12 s when cutting to the music, 2 and 5 s
+    (divided by `pace`) otherwise, unless given."""
     tl = Timeline.load(project.timeline_path)
     audio_path = project.out_dir / "fused_audio.wav"
     if not audio_path.exists() or audio_path.stat().st_mtime < project.timeline_path.stat().st_mtime:
@@ -322,10 +342,12 @@ def render_video(
         t1 = t0 + nf / OUT_FPS
         bm = maps[k] if k < len(maps) else None
         if bm is not None and bm.confidence >= MIN_CONFIDENCE and len(bm.beats) >= 4:
-            plan = plan_music(S, entries, vidx, t0, t1, bm, MUSIC_MIN_SHOT if min_shot is None else min_shot, max_shot, pace, LEAD, variety)
+            lo, hi = shot_limits(min_shot, max_shot, pace, music=True)
+            plan = plan_music(S, entries, vidx, t0, t1, bm, lo, hi, pace, LEAD, variety)
             music += 1
         else:
-            plan = plan_segment(S, entries, vidx, t0, t1, 3.0 if min_shot is None else min_shot, max_shot, margin, variety)
+            lo, hi = shot_limits(min_shot, max_shot, pace, music=False)
+            plan = plan_segment(S, entries, vidx, t0, t1, lo, hi, margin, variety)
             plain += 1
         for a, b, clip in plan:
             fa = round((min(max(a * GRID, t0), t1) - t0) * OUT_FPS)

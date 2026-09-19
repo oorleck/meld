@@ -74,6 +74,34 @@ def test_pace_scales_the_length():
     assert V.target_shot(0.5, 0.0, 120.0, pace=2.0) == pytest.approx(V.target_shot(0.5, 0.0, 120.0) / 2)
 
 
+# ---- how fast
+
+def test_the_default_pace_cuts_about_every_two_seconds_at_a_middling_tempo_and_intensity():
+    # measured on real concert audio, the old defaults cut every 3 s or so: this is about twice as often
+    assert V.target_shot(0.5, 0.0, 120.0) < 2.0
+    assert V.target_shot(1.0, 0.0, 120.0) == pytest.approx(0.8) and V.target_shot(0.0, 0.0, 120.0) == pytest.approx(4.0)
+    bm = regular_map(90.0, bpm=120, energy=0.5)
+    per_minute_now = per_minute(plan(bm, 90.0), 0, 90)
+    assert per_minute_now >= 28  # was 18 to 20 on the same kind of music
+
+
+def test_where_there_is_no_beat_shots_are_between_two_and_five_seconds_unless_asked_otherwise():
+    assert V.shot_limits(None, None, 1.0, music=False) == (2.0, 5.0)
+    assert V.shot_limits(None, None, 2.0, music=False) == (1.0, 2.5)  # --cut-pace works there too
+    assert V.shot_limits(1.5, 8.0, 2.0, music=False) == (1.5, 8.0)  # what was asked for is what it gets
+    assert V.shot_limits(None, None, 2.0, music=True) == (V.MUSIC_MIN_SHOT, V.MUSIC_MAX_SHOT)  # music: pace is in target_shot
+
+
+def test_the_editor_without_a_beat_cuts_at_least_every_five_seconds_when_there_is_another_angle():
+    entries = clips((0, 120), (0, 120))
+    S = quality(entries, 120.0)  # two cameras of the same quality: nothing to tell them apart
+    lo, hi = V.shot_limits(None, None, music=False)
+    shots = V.plan_segment(S, entries, [0, 1], 0.0, 120.0, lo, hi, 0.15, 0.8)
+    lengths = [(b - a) * V.GRID for a, b, c in shots]
+    assert max(lengths) <= V.PLAIN_MAX_SHOT + 1e-6 and min(lengths[:-1]) >= V.PLAIN_MIN_SHOT - 1e-6
+    assert 60.0 * len(shots) / 120 >= 10  # it used to be shots of 12 s: 5 cuts a minute
+
+
 # ---- the cuts
 
 
@@ -276,7 +304,7 @@ def test_it_can_be_told_not_to_cut_to_the_music(tmp_path):
     lines = []
     V.render_video(project, size=(320, 180), log=lines.append, beats=False)
     assert not any("Cut to the music" in line for line in lines)
-    assert min(_shot_lengths(project)[:-1]) >= 2.9  # the old way: never shorter than 3 s
+    assert min(_shot_lengths(project)[:-1]) >= V.PLAIN_MIN_SHOT - 0.1  # the old way: never shorter than its shortest
 
 
 def test_the_command_line_can_turn_it_off_and_set_the_pace(tmp_path, monkeypatch):

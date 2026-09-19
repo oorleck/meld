@@ -112,9 +112,12 @@ def _add_video(p: argparse.ArgumentParser) -> None:
     p.add_argument("--size", type=_size, default=(1920, 1080), help="output size, e.g. 1280x720")
     p.add_argument(
         "--min-shot", type=float, default=None,
-        help="shortest shot in seconds (default 0.9 when cutting to the music, 3 otherwise)",
+        help="shortest shot in seconds (default 0.7 when cutting to the music, 2 otherwise)",
     )
-    p.add_argument("--max-shot", type=float, default=12.0, help="longest shot (seconds)")
+    p.add_argument(
+        "--max-shot", type=float, default=None,
+        help="longest shot in seconds (default 12 when cutting to the music, 5 otherwise)",
+    )
     p.add_argument(
         "--no-beats", action="store_true",
         help="do not cut to the music: cut by picture quality only (by default cuts go on the beats, short shots where "
@@ -122,7 +125,7 @@ def _add_video(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--cut-pace", type=float, default=1.0, metavar="P",
-        help="how fast to cut to the music: 2 cuts twice as often, 0.5 half as often (default 1)",
+        help="how fast to cut: 2 cuts twice as often, 0.5 half as often (default 1: a cut about every 1.7 s to the music)",
     )
 
 
