@@ -91,6 +91,19 @@ def run(report=print, online: bool = False) -> bool:
         gap = offsets.get("b.mp4", 0) - offsets.get("a.mp4", 0)
         check("sync aligns the clips", len(tl.clips) == 2 and abs(gap - 12) < 0.05, f"offset {gap:.3f}s (expected 12)")
 
+        # the same matching with the comparisons in separate processes (in the installed app these are Meld.exe
+        # started again, which only works if the entry point handles it): same answer, and no fall-back to one at a time
+        lines: list[str] = []
+        tl2 = sync_project(project, log=lines.append, workers=2)
+        same = [(c.file, round(c.offset, 6)) for c in tl2.clips] == [(c.file, round(c.offset, 6)) for c in tl.clips]
+        used = any("at a time." in line and "Comparing" in line for line in lines)
+        fell_back = any("carrying on" in line for line in lines)
+        check(
+            "matching in worker processes", same and used and not fell_back and len(tl2.clips) == 2,
+            "same result as one at a time" if same and used and not fell_back
+            else f"same={same} started={used} fell back={fell_back}",
+        )
+
         wav = fuse_audio(project, log=lambda *_: None)
         check("audio fused", Path(wav).exists() and Path(wav).stat().st_size > 1_000_000)
 

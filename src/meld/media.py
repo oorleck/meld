@@ -70,9 +70,14 @@ def probe(path: Path) -> MediaInfo:
     return MediaInfo(duration, has_audio, has_video, width, height)
 
 
+def audio_cache_path(src: Path, cache_dir: Path, sr: int) -> Path:
+    """Where the decoded audio of `src` is kept (raw little-endian float32, mono, at `sr`)."""
+    return cache_dir / "audio" / f"{src.name}.{sr}.f32"
+
+
 def load_audio(src: Path, cache_dir: Path, sr: int) -> np.ndarray:
     """Mono float32 audio at `sr`, decoded once and memory-mapped from the cache."""
-    dst = cache_dir / "audio" / f"{src.name}.{sr}.f32"
+    dst = audio_cache_path(src, cache_dir, sr)
     dst.parent.mkdir(parents=True, exist_ok=True)
     if not dst.exists() or dst.stat().st_mtime < src.stat().st_mtime:
         run_ffmpeg(["-i", src, "-vn", "-ac", "1", "-ar", sr, "-f", "f32le", dst])

@@ -1,4 +1,5 @@
 """Entry point of the packaged app (Meld.exe): the window, or `--selftest` to check the install."""
+import multiprocessing
 import os
 import sys
 import tempfile
@@ -6,6 +7,10 @@ import traceback
 
 
 def main() -> int:
+    # Matching runs comparisons in worker processes. On Windows a worker is this same program started again with
+    # special arguments; this must come first, or every worker would open its own Meld window.
+    multiprocessing.freeze_support()
+
     if "--selftest" in sys.argv:
         # A windowed app has no console, so the report goes to a file.
         out = sys.argv[sys.argv.index("--selftest") + 1] if len(sys.argv) > sys.argv.index("--selftest") + 1 else None

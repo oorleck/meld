@@ -78,6 +78,11 @@ def _add_sync(p: argparse.ArgumentParser) -> None:
         "--cluster", type=int, default=1, metavar="N",
         help="fuse the N-th biggest group of clips instead of the biggest (see the list printed by sync)",
     )
+    p.add_argument(
+        "--match-workers", type=int, default=None, metavar="N",
+        help="compare N pairs of clips at once, in separate processes (default: automatic, up to 4 for big jobs; "
+             "1 = one at a time). The result is the same whatever N is, only the time differs",
+    )
 
 
 def _add_audio(p: argparse.ArgumentParser) -> None:
@@ -165,6 +170,7 @@ def main(argv: list[str] | None = None) -> None:
 
         sync_project(
             project, args.min_z, args.min_overlap, args.max_compare, _log, not args.no_clusters, args.cluster,
+            workers=args.match_workers,
         )
     if args.cmd in ("audio", "run", "auto"):
         from .audiofuse import fuse_audio

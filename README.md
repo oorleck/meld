@@ -118,6 +118,9 @@ Search results are only candidates. The sync step sorts the clips into groups th
 one group per concert or night) and fuses the biggest; the clips of the other groups are kept in `timeline.json`
 (`other_groups`) and clips that match nothing are listed there with a reason, so a wide search is fine. `--cluster N`
 fuses the N-th biggest group instead, and `--no-clusters` goes back to growing a single group from the longest clip.
+Comparisons run several at a time in separate processes (up to 4, for jobs of 8 or more clips of about 20 s or
+longer); `--match-workers N` sets the number, `1` being one at a time. The result is exactly the same either way,
+only the time differs (about 2x faster on a run of 24 clips of 2.5 to 4 minutes).
 
 The defaults are generous (up to 250 results per query and 500 clips), so a big run downloads a lot. Sync stays tractable because each clip is compared against at most `--max-compare` (default 25) clips that are already sorted, biggest group and longest clips first; raise it if clips you expect to match are being left out.
 
@@ -153,7 +156,9 @@ with several phones at similar zoom, so it is left in and checked automatically.
   `--min-z` standard deviations above the noise; a clip that matches nothing starts a group of its own; a clip that
   matches two groups is the bridge that makes them one. Clips that matched nothing then get a second look at each
   other. The biggest group is fused, so it no longer matters which clip is the longest or which concert it is from. In
-  the window, when several groups of three or more clips turn up, you are asked which one to use.
+  the window, when several groups of three or more clips turn up, you are asked which one to use. Comparisons are
+  spread over worker *processes*, not threads: run side by side in one process, the FFT gave a wrong answer about
+  once in a hundred comparisons, while separate processes gave exactly the one-at-a-time answers every time.
 - **audio**: every 0.5 s block of every clip is scored (clipping, level, agreement with the other clips'
   spectra); the output crossfades toward the best sources instead of summing mics, which would comb-filter.
 - **video**: clips are scored for sharpness and exposure; a greedy editor cuts between angles with a minimum
