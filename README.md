@@ -52,6 +52,15 @@ optional desktop one) and shows a personal-use notice. An installed copy can be 
 - **Only those two files are kept.** When a run finishes, the downloaded videos and all working files are deleted
   (only Meld's own; anything else in the folder stays). Turn on **Keep the downloaded videos** to keep them in
   `<folder>\<search>\`. A run that is cancelled or fails always keeps them, so trying again does not download them again.
+- **YouTube login (optional).** When YouTube answers "Sign in to confirm you're not a bot", downloads fail whatever
+  the video. The **YouTube login** link at the bottom of the window lets Meld use the login already saved in one of
+  your browsers (Firefox, Edge, Chrome or Brave, whichever are installed): sign in to YouTube in that browser, choose
+  it there and press Save. It is read once when a run starts, held in memory and never written to disk, to the log
+  or anywhere but YouTube. With a login, downloads run 2 at a time with a short pause between them and at most 100
+  candidates are previewed, because heavy automatic use can get a Google account limited by Google (a spare account
+  is an option). If it can't be read, Meld says what to do: Firefox is the most reliable; Chrome and Edge must be
+  closed and may not work at all, as they encrypt their cookies in a way that is not always readable. On the command
+  line it is `--cookies-from-browser firefox` (also `edge`, `chrome`, `brave`) on `fetch` and `auto`.
 - **The YouTube downloader (yt-dlp) updates itself**: YouTube breaks old versions every few weeks, so the app keeps
   its own copy in `%LOCALAPPDATA%\Meld` and refreshes it at start-up when it's older than two weeks
   (the "Update the YouTube downloader" link at the bottom of the window does it on demand). Uninstalling removes that folder but never your videos.
@@ -172,7 +181,8 @@ with several phones at similar zoom, so it is left in and checked automatically.
 - YouTube sometimes refuses downloads from a connection ("Sign in to confirm you're not a bot"), typically after many
   requests. Meld says so plainly instead of calling every video unavailable, stops asking after 6 refusals in a row
   and carries on with whatever did download; if nothing did, the run stops with an explanation. It usually passes after
-  some hours, or on another network (a phone hotspot often works at once). Meld does not use your YouTube login.
+  some hours, or on another network (a phone hotspot often works at once), or with the optional YouTube login above.
+  Meld only uses a login if you choose one.
 - Clips from different nights of the same tour can sync just as confidently as same-night ones when the show
   plays to backing tracks (seen in testing with Coldplay at Wembley: 17/20/21 Aug clips aligned with the 16 Aug
   ones). `sync` prints each clip's title so you can prune `clips/` and re-run.

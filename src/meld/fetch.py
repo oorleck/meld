@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import itertools
 import json
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 from . import ytdlp
 from .concerts import group_concerts
@@ -21,10 +23,23 @@ _VIDEO_ID = re.compile(r"(?:[?&]v=|youtu\.be/|/shorts/)([\w-]{11})")
 
 BLOCKED_MESSAGE = (
     "YouTube is refusing downloads from this connection: it asks to confirm you're not a bot. "
-    "This usually passes after some hours. Trying another network, such as a phone hotspot, often works right away."
+    "This usually passes after some hours. Trying another network, such as a phone hotspot, often works right away. "
+    "Or let Meld use the YouTube login from your browser (YouTube login, at the bottom of the window; "
+    "--cookies-from-browser on the command line)."
+)
+BLOCKED_WITH_LOGIN_MESSAGE = (
+    "YouTube is still refusing downloads, even with the login from your browser. Make sure you are signed in to "
+    "YouTube there, wait a few hours, or try another network, such as a phone hotspot."
 )
 BLOCK_LIMIT = 6  # this many downloads in a row refused: YouTube is blocking us, so stop asking for the rest
 _BLOCK_MARKERS = ("not a bot", "too many requests", "http error 429")
+
+
+# Browsers whose YouTube login Meld can be asked to use, most reliable first (Chrome and Edge lock or encrypt theirs).
+LOGIN_BROWSERS = {"firefox": "Firefox", "edge": "Microsoft Edge", "chrome": "Google Chrome", "brave": "Brave"}
+LOGIN_WORKERS = 2  # with a login, fewer downloads at once and a pause between them: heavy automatic use of an account
+LOGIN_PAUSE = (2, 5)  # (seconds, at least and at most) can get it limited
+_LOGIN_COOKIES = {"LOGIN_INFO", "SAPISID", "__Secure-3PAPISID", "__Secure-1PSID", "__Secure-3PSID"}  # signed in to Google
 
 
 def is_blocked(message: str) -> bool:
@@ -94,6 +109,71 @@ def search(
     return found, dropped
 
 
+def installed_browsers() -> list[str]:
+    """The browsers (keys of LOGIN_BROWSERS) that have a profile on this computer, most reliable first. Only whether
+    the folder exists is looked at, never what is in it."""
+    if os.name != "nt":
+        return list(LOGIN_BROWSERS)
+    roaming, local = os.environ.get("APPDATA"), os.environ.get("LOCALAPPDATA")
+    where = {
+        "firefox": (roaming, "Mozilla", "Firefox", "Profiles"),
+        "edge": (local, "Microsoft", "Edge", "User Data"),
+        "chrome": (local, "Google", "Chrome", "User Data"),
+        "brave": (local, "BraveSoftware", "Brave-Browser", "User Data"),
+    }
+    return [b for b, (base, *rest) in where.items() if base and Path(base, *rest).is_dir()]
+
+
+class _Quiet:
+    """The cookie reader of yt-dlp reports what it found. None of that is worth showing, and none of it may leak."""
+
+    def debug(self, msg) -> None:
+        pass
+
+    info = warning = error = debug
+
+
+def _read_browser_cookies(browser: str):
+    """The cookie jar of `browser`, read once, in memory. (Kept apart so tests need no real browser.)"""
+    ytdlp.import_yt_dlp()
+    from yt_dlp.cookies import extract_cookies_from_browser
+
+    return extract_cookies_from_browser(browser, logger=_Quiet())
+
+
+def login_error(name: str, message: str) -> str:
+    """What to tell the user when the login of browser `name` could not be read (`message` is what failed)."""
+    text = message.lower()
+    if any(w in text for w in ("could not copy", "permission", "locked", "being used")):
+        return (f"I couldn't read the login from {name} because it is open. Close {name} completely "
+                f"(also from the tray at the bottom right of the screen) and try again.")
+    if "dpapi" in text or "decrypt" in text:
+        return (f"{name} keeps its login in a form Meld can't read. Firefox works best: sign in to YouTube in Firefox "
+                f"and choose it under YouTube login.")
+    return f"I couldn't read the YouTube login from {name} ({short_reason(message)}). Firefox is the most reliable."
+
+
+def load_login(browser: str):
+    """The YouTube login stored in `browser`, to use for downloads. Raises SystemExit with what to do if there is none
+    to be had. It is held in memory for the run: nothing is written to disk or to the log."""
+    name = LOGIN_BROWSERS.get(browser, browser)
+    try:
+        jar = _read_browser_cookies(browser)
+    except FileNotFoundError:
+        raise SystemExit(
+            f"I couldn't find a YouTube login in {name}: it doesn't look installed here, or has never been used. "
+            f"Choose another browser under YouTube login."
+        ) from None
+    except Exception as e:  # noqa: BLE001 - whatever went wrong, the person needs to be told what to do about it
+        raise SystemExit(login_error(name, str(e))) from None
+    if not any(c.name in _LOGIN_COOKIES for c in jar):
+        raise SystemExit(
+            f"You don't seem to be signed in to YouTube in {name}. Open youtube.com there, sign in, close {name} "
+            f"and try again."
+        )
+    return jar
+
+
 class _Errors:
     """A logger for yt-dlp that keeps its error messages. With `ignoreerrors` it would otherwise print them somewhere
     nobody looks (the installed app has no console) and go on, leaving only 'it failed'."""
@@ -114,9 +194,16 @@ def _download(opts: dict, url: str):
     """The downloaded video's info. Raises with yt-dlp's own message when it fails and says why."""
     yt_dlp = ytdlp.import_yt_dlp()
 
+    opts = dict(opts)
+    cookies = opts.pop("_meld_cookies", None)  # the login, read once by fetch(): not once per video
     errors = _Errors()
-    with yt_dlp.YoutubeDL({**opts, "logger": errors}) as ydl:  # one instance per thread; they are not safe to share
-        info = ydl.extract_info(url, download=True)
+    try:
+        with yt_dlp.YoutubeDL({**opts, "logger": errors}) as ydl:  # one per thread; they are not safe to share
+            if cookies is not None:
+                ydl.cookiejar = cookies
+            info = ydl.extract_info(url, download=True)
+    except Exception as e:  # noqa: BLE001 - the reason it gave the logger is the useful one
+        raise RuntimeError(errors.messages[-1] if errors.messages else str(e)) from e
     if info is None and errors.messages:
         raise RuntimeError(errors.messages[-1])
     return info
@@ -141,10 +228,14 @@ def fetch(
     log=print,
     choose=None,
     audio_only: bool = False,
+    login_browser: str | None = None,
 ) -> None:
     """`choose(concerts)`, if given, is asked which one to use when the results turn out to be from several different
     concerts (see concerts.py): it returns one of them, or None for "use everything", or raises to abort.
-    `audio_only` downloads just the sound (a fraction of the size): enough to line clips up, not to cut video."""
+    `audio_only` downloads just the sound (a fraction of the size): enough to line clips up, not to cut video.
+    `login_browser` (a key of LOGIN_BROWSERS) has the downloads use the YouTube login stored in that browser, which is
+    what gets past 'confirm you're not a bot'. It is read once and kept in memory only; downloads then run fewer at a
+    time, with a pause between them."""
     targets = [{"url": u, "title": None, "id": video_id(u), "uploader": None, "duration": None} for u in urls]
     def run_search(q: str):
         relevance = Relevance.from_query(match_query or q, require_date, concert_only) if strict else None
@@ -210,6 +301,12 @@ def fetch(
         else:
             todo.append(t)
 
+    if login_browser and todo:
+        opts["_meld_cookies"] = load_login(login_browser)
+        opts["sleep_interval"], opts["max_sleep_interval"] = LOGIN_PAUSE
+        workers = min(workers, LOGIN_WORKERS)
+        log(f"Using the YouTube login from {LOGIN_BROWSERS.get(login_browser, login_browser)} (kept in memory only).")
+
     ok = failed = blocked = refused_in_a_row = 0
     stopped = False
     pool = ThreadPoolExecutor(max_workers=workers)
@@ -252,8 +349,9 @@ def fetch(
         project.sources_path.write_text(json.dumps(sources, indent=2), encoding="utf-8")
     log(f"Downloaded {ok}, failed {failed}. Clips are in {project.clips_dir}")
     if blocked and not ok and (stopped or blocked == failed):
-        log(BLOCKED_MESSAGE)
-        raise SystemExit(BLOCKED_MESSAGE)  # nothing can come of this run: say why, in words a person can act on
+        message = BLOCKED_WITH_LOGIN_MESSAGE if login_browser else BLOCKED_MESSAGE
+        log(message)
+        raise SystemExit(message)  # nothing can come of this run: say why, in words a person can act on
     if stopped:  # some downloads did work: go on with those rather than throw them away
         log(f"YouTube started refusing downloads (it asks to confirm you're not a bot), so the rest were skipped. "
             f"Going on with the {ok} that worked.")

@@ -18,7 +18,7 @@ from pathlib import Path
 
 from . import ytdlp
 from .audiofuse import fuse_audio
-from .fetch import BLOCKED_MESSAGE, expand_queries, fetch, is_blocked
+from .fetch import BLOCKED_MESSAGE, LOGIN_BROWSERS, expand_queries, fetch, installed_browsers, is_blocked
 from .naming import concert_name, shared_words, trim_connectors, unique_stem
 from .project import _PARTIAL, Project, slugify
 from .sync import line_up_downloads, sync_project
@@ -46,11 +46,13 @@ MB_PER_CLIP = {480: 15, 720: 30, 1080: 60}  # rough download size, to warn befor
 # of the group the user picks are downloaded in full. More candidates are previewed than videos wanted, because only
 # one of the groups they fall into is used.
 PREVIEW_FACTOR, PREVIEW_MAX, PREVIEW_MB = 2, 250, 6
+LOGIN_MAX_PREVIEWS = 100  # with a YouTube login in use, fewer requests: heavy automatic use can get an account limited
 
 
-def preview_count(clips: int) -> int:
+def preview_count(clips: int, login: bool = False) -> int:
     """How many candidates get an audio preview when `clips` videos are wanted."""
-    return min(clips * PREVIEW_FACTOR, PREVIEW_MAX)
+    n = min(clips * PREVIEW_FACTOR, PREVIEW_MAX)
+    return min(n, LOGIN_MAX_PREVIEWS) if login else n
 
 
 class Cancelled(Exception):
@@ -68,6 +70,7 @@ class Settings:
     clips: int = 100
     quality: int = 720
     keep_files: bool = False  # keep the downloaded videos and working files after a successful run
+    login: str | None = None  # a browser (a key of LOGIN_BROWSERS) whose YouTube login the downloads use
 
     @property
     def project_dir(self) -> Path:
@@ -81,7 +84,7 @@ class Settings:
         return OUTPUT_SIZES[min(OUTPUT_SIZES)]
 
     def disk_needed_gb(self) -> float:
-        previews = preview_count(self.clips) * PREVIEW_MB
+        previews = preview_count(self.clips, bool(self.login)) * PREVIEW_MB
         return (previews + self.clips * MB_PER_CLIP.get(self.quality, 60) + 1500) / 1024
 
 
@@ -131,13 +134,13 @@ def run_pipeline(s: Settings, log=print, stage=lambda i, name: None, choose_grou
     {"video", "audio", "folder", "minutes", "used", "skipped"}."""
     project = Project(s.project_dir)
     preview = project.preview()
-    wanted = preview_count(s.clips)
+    wanted = preview_count(s.clips, bool(s.login))
 
     stage(0, STAGES[0])
     fetch(
         preview, [], expand_queries(s.query),
         limit=max(wanted, 30), min_duration=20, max_duration=900, max_clips=wanted, match_query=s.query,
-        log=log, audio_only=True,
+        log=log, audio_only=True, login_browser=s.login,
     )
     previewed = len(preview.clip_files())
     if not previewed:
@@ -159,7 +162,7 @@ def run_pipeline(s: Settings, log=print, stage=lambda i, name: None, choose_grou
     stage(2, STAGES[2])
     fetch(
         project, [f"https://www.youtube.com/watch?v={Path(c.file).stem}" for c in chosen], [],
-        max_height=s.quality, max_clips=None, log=log,
+        max_height=s.quality, max_clips=None, log=log, login_browser=s.login,
     )
 
     stage(3, STAGES[3])
@@ -263,7 +266,7 @@ def save_settings(s: Settings) -> None:
         _settings_path().write_text(
             json.dumps({
                 "folder": str(s.folder), "clips": s.clips, "quality": s.quality, "query": s.query,
-                "keep": s.keep_files,
+                "keep": s.keep_files, "login": s.login,
             }),
             encoding="utf-8",
         )
@@ -485,6 +488,7 @@ def main(hook=None) -> None:
     clips_var = tk.IntVar(value=saved.get("clips", 100))
     quality_var = tk.IntVar(value=saved.get("quality", 720))
     keep_var = tk.BooleanVar(value=bool(saved.get("keep", False)))
+    login_var = tk.StringVar(value=saved.get("login") or "")  # a browser whose YouTube login to use, or ""
     folder_var =tk.StringVar(value=saved.get("folder", str(default_folder())))
     folder_shown = tk.StringVar(value=shorten_path(folder_var.get()))
     folder_var.trace_add("write", lambda *_: folder_shown.set(shorten_path(folder_var.get())))
@@ -658,10 +662,12 @@ def main(hook=None) -> None:
     # padding=0 on the outer edges so the link text lines up with the content above
     details_btn = ttk.Button(footer, style="Link.TButton", cursor="hand2", text="Show details", padding=(0, px(4)))
     details_btn.grid(row=0, column=0, sticky="w")
+    login_btn = ttk.Button(footer, style="Link.TButton", cursor="hand2", text="YouTube login")
+    login_btn.grid(row=0, column=2)
     update_btn = ttk.Button(footer, style="Link.TButton", cursor="hand2", text="Update the YouTube downloader")
-    update_btn.grid(row=0, column=2)
+    update_btn.grid(row=0, column=3)
     about_btn = ttk.Button(footer, style="Link.TButton", cursor="hand2", text="About", padding=(px(8), px(4), 0, px(4)))
-    about_btn.grid(row=0, column=3)
+    about_btn.grid(row=0, column=4)
 
     def toggle_details() -> None:
         show_details.set(not show_details.get())
@@ -689,6 +695,7 @@ def main(hook=None) -> None:
         cancel_btn.configure(state="normal" if running else "disabled")
         entry.configure(state="disabled" if running else "normal")
         keep_btn.configure(state="disabled" if running else "normal")
+        login_btn.configure(state="disabled" if running else "normal")
 
     def worker(s: Settings) -> None:
         s.project_dir.mkdir(parents=True, exist_ok=True)
@@ -746,7 +753,7 @@ def main(hook=None) -> None:
             messagebox.showinfo(APP_NAME, "Please type which concert to look for, for example:  Metallica 2003")
             entry.focus_set()
             return
-        s = Settings(query, Path(folder_var.get()), clips_var.get(), quality_var.get(), keep_var.get())
+        s = Settings(query, Path(folder_var.get()), clips_var.get(), quality_var.get(), keep_var.get(), login_var.get() or None)
         try:
             s.folder.mkdir(parents=True, exist_ok=True)
             free = shutil.disk_usage(s.folder).free / 1024**3
@@ -790,17 +797,11 @@ def main(hook=None) -> None:
         add_log(details)
         messagebox.showerror(APP_NAME, message + "\n\n(Choose \"Show details\" for technical information.)")
 
-    def ask_group(options) -> None:
-        """Several groups of videos line up with each other, but not with the others: let the user pick one. The answer
-        (one of `options`, or "cancel") goes to `answers`."""
-        shown = options[:MAX_GROUPS_SHOWN]
-        heading = "Which group?"
-        earlier_status = step_var.get()
-        step_var.set("Waiting for you to choose a group")
-
+    def make_modal(title: str):
+        """A dialog window over the main one, not shown yet. Returns (window, the frame to put its content in)."""
         win = tk.Toplevel(root)
         win.withdraw()
-        win.title(heading)
+        win.title(title)
         win.configure(background=BG)
         win.transient(root)
         win.resizable(False, False)
@@ -811,6 +812,31 @@ def main(hook=None) -> None:
                 pass
         body = ttk.Frame(win, padding=(px(26), px(22), px(26), px(18)))
         body.pack(fill="both", expand=True)
+        return win, body
+
+    def show_modal(win) -> None:
+        win.update_idletasks()  # centre it over the main window, style it, then show it
+        x = root.winfo_rootx() + (root.winfo_width() - win.winfo_reqwidth()) // 2
+        y = root.winfo_rooty() + max(0, (root.winfo_height() - win.winfo_reqheight()) // 3)
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        style_titlebar(win)
+        win.deiconify()
+        try:
+            win.wait_visibility()
+            win.grab_set()  # nothing else in the app to click while it waits
+        except tk.TclError:
+            pass
+        win.focus_force()
+
+    def ask_group(options) -> None:
+        """Several groups of videos line up with each other, but not with the others: let the user pick one. The answer
+        (one of `options`, or "cancel") goes to `answers`."""
+        shown = options[:MAX_GROUPS_SHOWN]
+        heading = "Which group?"
+        earlier_status = step_var.get()
+        step_var.set("Waiting for you to choose a group")
+
+        win, body = make_modal(heading)
         ttk.Label(body, text=heading, style="Heading.TLabel").pack(anchor="w")
         ttk.Label(
             body, style="Hint.TLabel", justify="left", wraplength=px(540),
@@ -852,18 +878,65 @@ def main(hook=None) -> None:
         win.bind("<Escape>", lambda e: finish_choice("cancel"))
         win.bind("<Return>", lambda e: finish_choice(shown[choice.get()]))
 
-        win.update_idletasks()  # centre it over the main window, style it, then show it
-        x = root.winfo_rootx() + (root.winfo_width() - win.winfo_reqwidth()) // 2
-        y = root.winfo_rooty() + max(0, (root.winfo_height() - win.winfo_reqheight()) // 3)
-        win.geometry(f"+{max(0, x)}+{max(0, y)}")
-        style_titlebar(win)
-        win.deiconify()
-        try:
-            win.wait_visibility()
-            win.grab_set()  # nothing else in the app to click while it waits
-        except tk.TclError:
-            pass
-        win.focus_force()
+        show_modal(win)
+
+    def login_label() -> str:
+        return f"YouTube login: {LOGIN_BROWSERS.get(login_var.get(), login_var.get())}" if login_var.get() else "YouTube login"
+
+    def ask_login() -> None:
+        """Let the user choose a browser whose YouTube login the downloads use, for when YouTube asks to confirm they
+        are not a bot. Only saved on Save."""
+        win, body = make_modal("YouTube login")
+        ttk.Label(body, text="YouTube login", style="Heading.TLabel").pack(anchor="w")
+        for text, pad in (
+            ("Use this if YouTube keeps saying it wants to confirm you're not a bot. Meld can use the YouTube login that "
+             "is already saved in one of your browsers, so sign in to YouTube in that browser first.", (px(6), px(8))),
+            ("Meld reads it only for this, keeps it in memory while it runs, and never saves it or sends it anywhere but "
+             "to YouTube. Downloads go a little slower and gentler. Downloading a lot with an account can get it limited "
+             "by Google, so you may prefer a spare account.", (0, px(8))),
+            ("Firefox is the most reliable. Chrome and Edge must be closed while Meld runs, and may not work at all.",
+             (0, px(14))),
+        ):
+            ttk.Label(body, style="Hint.TLabel", justify="left", wraplength=px(540), text=text).pack(anchor="w", pady=pad)
+
+        offered = installed_browsers() or list(LOGIN_BROWSERS)
+        if login_var.get() and login_var.get() not in offered:
+            offered.append(login_var.get())  # one chosen earlier stays visible, even if it seems to have gone
+        choice = tk.StringVar(value=login_var.get())
+        ttk.Radiobutton(
+            body, text="Don't use a login (the default)", value="", variable=choice, style="ChoiceRow.Toolbutton",
+            cursor="hand2",
+        ).pack(fill="x", pady=(0, px(6)))
+        for browser in offered:
+            ttk.Radiobutton(
+                body, text=LOGIN_BROWSERS.get(browser, browser), value=browser, variable=choice,
+                style="ChoiceRow.Toolbutton", cursor="hand2",
+            ).pack(fill="x", pady=(0, px(6)))
+
+        def close(save: bool) -> None:
+            if save:
+                login_var.set(choice.get())
+                login_btn.configure(text=login_label())
+                save_settings(Settings(
+                    query_var.get().strip(), Path(folder_var.get()), clips_var.get(), quality_var.get(), keep_var.get(),
+                    login_var.get() or None,
+                ))
+            try:
+                win.grab_release()
+            except tk.TclError:
+                pass
+            win.destroy()
+
+        row = ttk.Frame(body)
+        row.pack(fill="x", pady=(px(14), 0))
+        ttk.Button(row, text="Save", style="Primary.TButton", cursor="hand2", command=lambda: close(True)).pack(side="left")
+        ttk.Button(
+            row, text="Cancel", style="Secondary.TButton", cursor="hand2", command=lambda: close(False),
+        ).pack(side="left", padx=px(12))
+        win.protocol("WM_DELETE_WINDOW", lambda: close(False))
+        win.bind("<Escape>", lambda e: close(False))
+        win.bind("<Return>", lambda e: close(True))
+        show_modal(win)
 
     def poll() -> None:
         try:
@@ -942,6 +1015,7 @@ def main(hook=None) -> None:
             "against its terms, and concert footage is usually copyrighted.",
         )
 
+    login_btn.configure(text=login_label(), command=ask_login)
     update_btn.configure(command=update_downloader)
     about_btn.configure(command=about)
     start_btn.configure(command=start)
@@ -982,7 +1056,7 @@ def main(hook=None) -> None:
     root.after(100, poll)
     if hook:
         widgets = {
-            "query": query_var, "folder": folder_var, "clips": clips_var, "quality": quality_var,
+            "query": query_var, "folder": folder_var, "clips": clips_var, "quality": quality_var, "login": login_var,
             "start": start_btn, "step": step_var, "detail": detail_var, "result": result_label, "play": play_btn,
             "queue": q, "keep": keep_var,
         }

@@ -58,6 +58,7 @@ class FakeYouTube:
         self.folder = folder
         self.titles = titles or {}
         self.calls: list[tuple[str, bool, list[str], int | None]] = []  # (kind, audio only, ids, max height)
+        self.kwargs: list[dict] = []  # what each call was asked, whole
         folder.mkdir(parents=True, exist_ok=True)
 
     def add(self, name: str, audio, video_src: str = "testsrc2=size=640x360:rate=30") -> None:
@@ -75,6 +76,7 @@ class FakeYouTube:
         project.sources_path.write_text(json.dumps(sources), encoding="utf-8")
         kind = "preview" if project.root.name == "preview" else "video"
         self.calls.append((kind, bool(kw.get("audio_only")), ids, kw.get("max_height")))
+        self.kwargs.append(kw)
 
     def downloaded(self, kind: str) -> list[str]:
         return [i for k, _, ids, _ in self.calls if k == kind for i in ids]
@@ -314,3 +316,55 @@ def test_shorten_path_keeps_both_ends():
     long = "C:/Users/someone/AppData/Local/Temp/a-very-long-folder-name/another-long-one/results"
     out = shorten_path(long)
     assert len(out) <= 56 and out.startswith(long[:18]) and out.endswith(long[-10:]) and " ... " in out
+
+
+# ---- the YouTube login (for when YouTube asks to confirm you are not a bot)
+
+
+def test_the_chosen_browser_is_remembered_and_off_by_default(tmp_path, monkeypatch):
+    monkeypatch.setattr(gui, "_settings_path", lambda: tmp_path / "settings.json")
+    assert Settings("x", tmp_path).login is None
+    assert gui.load_saved().get("login") is None
+    gui.save_settings(Settings("x", tmp_path, login="firefox"))
+    assert gui.load_saved()["login"] == "firefox"
+    gui.save_settings(Settings("x", tmp_path))  # switched off again
+    assert gui.load_saved()["login"] is None
+
+
+def test_with_a_login_fewer_previews_are_asked_for_and_less_room_is_needed(tmp_path):
+    assert gui.preview_count(500) == gui.PREVIEW_MAX and gui.preview_count(20) == 40  # as before without a login
+    assert gui.preview_count(500, login=True) == gui.LOGIN_MAX_PREVIEWS < gui.PREVIEW_MAX
+    assert gui.preview_count(20, login=True) == 40  # small runs are not touched
+    assert Settings("x", tmp_path, clips=500, login="firefox").disk_needed_gb() < Settings("x", tmp_path, clips=500).disk_needed_gb()
+
+
+def test_the_login_reaches_both_downloads_and_caps_the_previews(tmp_path, monkeypatch):
+    yt = FakeYouTube(tmp_path / "youtube")
+    _one_concert(yt)
+    monkeypatch.setattr(gui, "fetch", yt)
+    run_pipeline(Settings("login show 2024", tmp_path, clips=500, quality=480, login="firefox"), log=lambda *_: None)
+    previews, videos = yt.kwargs
+    assert previews["login_browser"] == videos["login_browser"] == "firefox"  # the previews and the full videos
+    assert previews["max_clips"] == gui.LOGIN_MAX_PREVIEWS
+
+
+def test_without_a_login_nothing_is_passed_on(tmp_path, monkeypatch):
+    yt = FakeYouTube(tmp_path / "youtube")
+    _one_concert(yt)
+    monkeypatch.setattr(gui, "fetch", yt)
+    run_pipeline(Settings("no login 2024", tmp_path, clips=500, quality=480), log=lambda *_: None)
+    previews, videos = yt.kwargs
+    assert previews["login_browser"] is None and videos["login_browser"] is None
+    assert previews["max_clips"] == gui.PREVIEW_MAX
+
+
+def test_a_login_that_cannot_be_read_is_shown_in_plain_words(tmp_path, monkeypatch):
+    message = "I couldn't read the login from Google Chrome because it is open. Close Google Chrome completely."
+
+    def refused(*a, **k):
+        raise SystemExit(message)
+
+    monkeypatch.setattr(gui, "fetch", refused)
+    with pytest.raises(SystemExit) as e:
+        run_pipeline(Settings("x", tmp_path, login="chrome"), log=lambda *_: None)
+    assert friendly_error(e.value) == message

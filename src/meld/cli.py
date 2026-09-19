@@ -31,6 +31,13 @@ def _add_fetch_opts(p: argparse.ArgumentParser, limit=250, max_duration=3600, ma
     p.add_argument("--require", action="append", default=[], metavar="WORD", help="title must contain WORD (repeatable)")
     p.add_argument("--workers", type=int, default=4, help="parallel downloads")
     p.add_argument(
+        "--cookies-from-browser", choices=["firefox", "edge", "chrome", "brave"], default=None, metavar="BROWSER",
+        help="use the YouTube login stored in this browser (firefox, edge, chrome, brave), which gets past YouTube's "
+             "'confirm you're not a bot'. Read once and kept in memory only; fewer downloads at a time, with a pause "
+             "between them. Heavy automatic use can get a Google account limited: consider a spare one. Chrome and "
+             "Edge must be closed, and may not work at all; Firefox is the most reliable",
+    )
+    p.add_argument(
         "--require-date", action="store_true",
         help="drop titles that state no date or year at all (default: only for year-only queries like 'metallica 2003')",
     )
@@ -152,6 +159,7 @@ def main(argv: list[str] | None = None) -> None:
             args.max_height, args.dry_run, args.require, args.max_clips, args.workers,
             not args.loose, args.query if args.cmd == "auto" else None,
             True if args.require_date else (False if args.allow_undated else None), not args.any_video, _log,
+            login_browser=args.cookies_from_browser,
         )
         if args.cmd == "fetch" or args.dry_run:
             return

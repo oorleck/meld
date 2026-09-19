@@ -74,6 +74,19 @@ def run(report=print, online: bool = False) -> bool:
         check("yt-dlp works", False, repr(e))
     check("ffmpeg found", Path(ffmpeg_exe()).exists(), ffmpeg_exe())
 
+    # what reading a browser's saved YouTube login needs: yt-dlp's cookie reader and SQLite, which the packaged app can
+    # be missing without anything else noticing (nothing is read from any browser here)
+    try:
+        import sqlite3
+
+        from yt_dlp import dependencies
+        from yt_dlp.cookies import extract_cookies_from_browser  # noqa: F401
+
+        sqlite3.connect(":memory:").close()
+        check("browser login support", dependencies.sqlite3 is not None, "yt-dlp can read a browser's cookie database")
+    except Exception as e:  # noqa: BLE001
+        check("browser login support", False, repr(e))
+
     with tempfile.TemporaryDirectory(prefix="meld-selftest-") as tmp:
         project = Project(tmp)
         music = _music(40)
