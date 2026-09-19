@@ -130,11 +130,15 @@ def _add_video(p: argparse.ArgumentParser) -> None:
 
 
 def _add_recon(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--at", type=float, default=None, help="time (s on the shared timeline); default: when most phones are filming")
+    p.add_argument("--at", type=float, default=None, help="time (s on the shared timeline); default: the moment at which the most phones see the same thing")
     p.add_argument("--max-views", type=int, default=24, help="most phones to use (best-looking first)")
     p.add_argument("--keep", type=float, default=0.5, help="fraction of the most confident pixels to keep")
     p.add_argument("--min-conf", type=float, default=1.5, help="drop pixels the model is less sure about than this")
     p.add_argument("--max-points", type=int, default=1_000_000)
+    p.add_argument(
+        "--scan", action="store_true",
+        help="do not reconstruct: list the moments at which enough phones see the same thing, the most promising first",
+    )
     p.add_argument("--force", action="store_true", help="write the result even when the model reports low confidence")
     p.add_argument("--no-video", action="store_true", help="skip the swing.mp4 fly-around")
     p.add_argument("--size", type=_size, default=(1280, 720), help="fly-around video size")
@@ -196,7 +200,7 @@ def main(argv: list[str] | None = None) -> None:
 
         reconstruct(
             project, args.at, args.max_views, args.keep, args.min_conf, args.max_points,
-            not args.no_video, args.size, args.force, _log,
+            not args.no_video, args.size, args.force, _log, scan=args.scan,
         )
         return
 

@@ -178,13 +178,17 @@ uv run --extra recon meld reconstruct -p projects/show [--at 120]
 ```
 
 Because the clips are synced, the frame at one instant from every phone that was filming shows the same moment.
-`reconstruct` picks the moment when the most phones overlap (or `--at SECONDS`), feeds those frames to
+`reconstruct` first works out which of the phones filming can see the same thing (frames whose features match, checked
+geometrically: a wide shot from the crowd and a close-up of the drummer on the big screen have none in common), takes
+the moment at which most of them do (or `--at SECONDS`), feeds the frames of those phones to
 [VGGT](https://github.com/facebookresearch/vggt) (camera poses and dense depth in one pass) and writes
 `out/recon_<t>s/`: `scene.ply` (coloured point cloud), `cameras.json`, `viewer.html` (orbit the scene in a
 browser and jump to each phone's viewpoint; needs internet for three.js), `swing.mp4` (a virtual camera swinging
 around the scene) and the source frames. The first run downloads about 4.7 GB of model weights to
 `~/.cache/huggingface` and fetches VGGT's source to `~/.cache/meld`. Use `uv run --extra recon ...` (a plain
-`uv sync` removes the extra). The model and its weights are under Meta's own research licence.
+`uv sync` removes the extra). The model and its weights are under Meta's own research licence. `--scan` lists the
+moments at which enough phones see the same thing without running the model, the most promising first; when fewer
+than three do at the moment chosen, `reconstruct` says so instead of handing the model views it can do nothing with.
 
 **It does not work on the concert footage tried so far.** It works well on sharp, well-lit photos (VGGT's sample
 scenes give a coherent model with median confidence about 12), but on real Wembley clips, 13 phones at one instant,

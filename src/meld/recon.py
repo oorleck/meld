@@ -1,7 +1,7 @@
 """3D reconstruction of one moment of the concert.
 
 The clips are already synced, so the frame at time t of every phone that was filming shows the same instant.
-Those frames go through VGGT (a feed-forward multi-view model: camera poses + dense depth in one pass).
+Only the phones that see the same thing as another (views.py) are used. Those frames go through VGGT (a feed-forward multi-view model: camera poses + dense depth in one pass).
 Outputs, in out/recon_<t>s/: scene.ply (coloured point cloud), cameras.json, viewer.html (orbit the scene and jump
 to each phone's viewpoint), swing.mp4 (a virtual camera swinging around the scene) and the source frames.
 
@@ -34,6 +34,7 @@ VGGT_COMMIT = "a288dd0f14786c93483e45524328726ab7b1b4ce"
 VGGT_WEIGHTS = "facebook/VGGT-1B"
 SIZE = 518  # VGGT's working resolution
 GOOD_CONF = 2.0  # a pixel the model is reasonably sure about (VGGT's own samples reach 5-25)
+SCAN_STEP = 10.0  # seconds between the moments that are looked at, to see which phones see the same thing
 
 
 def ensure_vggt_source() -> Path:
@@ -456,6 +457,24 @@ def reconstruct_frames(
     return out
 
 
+def best_moment(project: Project, tl: Timeline, max_views: int, tries: int = 6, log=print):
+    """The moment at which the most phones see the same thing, looked for among those with the most phones filming
+    (at most `tries` of them, no two within 20 s of each other). Returns a views.Moment."""
+    from . import views as seeing
+
+    crowded = sorted(seeing.candidate_times(tl, step=SCAN_STEP, at_least=2), key=lambda t: (-len(seeing.live_clips(tl, t)), t))
+    chosen: list[float] = []
+    for t in crowded:
+        if all(abs(t - u) >= 20.0 for u in chosen):
+            chosen.append(t)
+        if len(chosen) >= tries:
+            break
+    if not chosen:
+        raise SystemExit("No moment has two phones filming it.")
+    log(f"Looking at which phones see the same thing at {len(chosen)} moments ...")
+    return seeing.scan(project, tl, chosen, max_views, log=log)[0]
+
+
 def reconstruct(
     project: Project,
     at: float | None = None,
@@ -467,13 +486,38 @@ def reconstruct(
     size=(1280, 720),
     force: bool = False,
     log=print,
+    scan: bool = False,
 ) -> Path | None:
+    """Reconstruct one moment. Only the phones that see the same thing (views.py) are used: phones are not picked for how
+    sharp they are, as they were, since a wide shot from the crowd and a close-up of the drummer have nothing in common
+    and the model then has nothing to go on. `scan` only lists the moments, the most promising first."""
+    from . import views as seeing
+
     tl = Timeline.load(project.timeline_path)
-    t = pick_moment(tl) if at is None else at
-    views = select_views(project, tl, t, max_views)
-    if len(views) < 2:
-        raise SystemExit(f"Only {len(views)} clip(s) cover t={t:.1f}s; need at least 2. Try --at with another time.")
-    log(f"Moment t={t:.1f}s: {len(views)} phones filming it.")
+    if scan:
+        times = seeing.candidate_times(tl, step=SCAN_STEP)
+        if not times:
+            raise SystemExit("No moment has three phones filming it.")
+        log(f"{len(times)} moments have at least {seeing.MIN_VIEWS} phones filming. Which see the same thing:")
+        moments = seeing.scan(project, tl, times, max_views, log=log)
+        log("\nThe most promising, best first (use --at SECONDS):")
+        for m in moments[:8]:
+            log(f"  {m.t:7.1f}s  {len(m.best)} of {len(m.clips)} phones see the same thing, held together by {m.strength} matches")
+        return None
+
+    if at is None:
+        moment = best_moment(project, tl, max_views, log=log)
+    else:
+        moment = seeing.look_at(project, tl, at, max_views)
+    t = moment.t
+    log(f"Moment t={t:.1f}s: {len(moment.clips)} phones filming it, {len(moment.best)} of them see the same thing.")
+    if len(moment.best) < seeing.MIN_VIEWS and not force:
+        raise SystemExit(
+            f"At t={t:.1f}s only {len(moment.best)} of the {len(moment.clips)} phones filming see the same thing as another "
+            f"(a 3D model needs at least {seeing.MIN_VIEWS} that do): the rest look at other parts of the scene, from too "
+            f"far apart or at a different zoom. Try `--scan` to find a better moment, or `--force` to try anyway."
+        )
+    views = moment.best if len(moment.best) >= 2 else moment.clips
     out = project.out_dir / f"recon_{t:.0f}s"
     frames = extract_frames(project, tl, views, t, out / "frames")
     return reconstruct_frames(frames, [tl.clips[i].file for i in views], out, keep, min_conf, max_points, video, size, force, log)
