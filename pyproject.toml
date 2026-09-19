@@ -1,0 +1,52 @@
+[project]
+name = "meld"
+version = "0.1.0"
+description = "Find phone videos of the same concert, sync them on audio, and fuse them into one long video and audio track."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "yt-dlp",
+    "imageio-ffmpeg>=0.5.1",
+]
+
+[project.optional-dependencies]
+# 3D reconstruction: `uv sync --extra recon` (PyTorch + CUDA, ~3 GB, plus ~5 GB of model weights on first use).
+# The VGGT model code itself is fetched from GitHub at a pinned commit on first use (see recon.py).
+recon = [
+    "torch>=2.6",
+    "huggingface_hub",
+    "einops",
+    "safetensors",
+    "pillow",
+]
+
+[project.scripts]
+meld = "meld.cli:main"
+
+[project.gui-scripts]
+meld-gui = "meld.gui:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+# building the Windows installer: see packaging/build.ps1
+build = ["pyinstaller>=6", "pillow"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/meld"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

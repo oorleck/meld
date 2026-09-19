@@ -1,0 +1,18 @@
+Meld
+
+Finds phone videos of a concert online, lines them up by their sound and combines them into one video with
+the best of the sound.
+
+FOR PERSONAL USE ONLY
+Meld downloads videos from YouTube. Doing so may go against YouTube's terms of service, and concert
+footage is usually protected by copyright. Use it for your own viewing and do not publish or share the videos
+it makes.
+
+Software included
+- FFmpeg, for reading and writing video and sound (a build licensed under the GNU GPL; source code is
+  available from https://ffmpeg.org).
+- yt-dlp, for downloading (public domain, Unlicense).
+- Python, NumPy and SciPy (PSF / BSD licenses).
+
+Meld keeps a few small files in %LOCALAPPDATA%\Meld (an updated copy of the downloader and your
+last choices). The videos it makes are saved in the folder you choose, by default Documents\Meld.

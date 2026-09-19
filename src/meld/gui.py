@@ -1,0 +1,756 @@
+"""A simple window: type what concert to look for, press Start, get one combined video.
+
+The work is done by the same functions the command line uses (fetch, sync, audio, video); this module only
+gathers a few plain choices, runs them in a background thread and shows progress.
+"""
+from __future__ import annotations
+
+import json
+import os
+import queue
+import re
+import shutil
+import sys
+import threading
+import traceback
+from dataclasses import dataclass
+from pathlib import Path
+
+from . import ytdlp
+from .audiofuse import fuse_audio
+from .fetch import expand_queries, fetch
+from .project import Project, slugify
+from .sync import sync_project
+from .videocut import render_video
+
+APP_NAME = "Meld"
+STAGES = [
+    "Finding and downloading videos",
+    "Lining the videos up",
+    "Mixing the sound",
+    "Cutting the video",
+]
+STEP_NAMES = ["Find videos", "Line them up", "Mix the sound", "Cut the video"]  # short forms of STAGES
+IDLE_TEXT = "Ready when you are."
+EXAMPLES = ["Metallica 2003", "Coldplay Wembley 16 August 2022"]
+CLIP_CHOICES = [("A few (quickest)", 20), ("A good amount", 100), ("As many as I can find (slow)", 500)]
+QUALITY_CHOICES = [("Full HD (1080p)", 1080), ("Smaller and faster (720p)", 720)]
+MB_PER_CLIP = {720: 30, 1080: 60}  # rough download size, to warn before filling the disk
+
+
+class Cancelled(Exception):
+    """Raised from the log callback when the user presses Cancel; unwinds whatever step is running."""
+
+
+class UserError(Exception):
+    """A problem worth explaining to the user in plain words."""
+
+
+@dataclass
+class Settings:
+    query: str
+    folder: Path  # each search gets its own sub-folder in here
+    clips: int = 100
+    quality: int = 720
+
+    @property
+    def project_dir(self) -> Path:
+        return Path(self.folder) / slugify(self.query)
+
+    @property
+    def size(self) -> tuple[int, int]:
+        return (1920, 1080) if self.quality >= 1080 else (1280, 720)
+
+    def disk_needed_gb(self) -> float:
+        return (self.clips * MB_PER_CLIP.get(self.quality, 60) + 1500) / 1024
+
+
+def run_pipeline(s: Settings, log=print, stage=lambda i, name: None) -> dict:
+    """Search, download, line up, mix and cut. Returns {"video", "folder", "minutes", "used", "skipped"}."""
+    project = Project(s.project_dir)
+    stage(0, STAGES[0])
+    fetch(
+        project, [], expand_queries(s.query),
+        limit=max(s.clips, 30), min_duration=20, max_duration=900, max_height=s.quality,
+        max_clips=s.clips, match_query=s.query, log=log,
+    )
+    if not project.clip_files():
+        raise UserError(
+            "I couldn't find any matching videos. Try fewer words, for example just the band and the year."
+        )
+
+    stage(1, STAGES[1])
+    tl = sync_project(project, log=log)
+    if not tl.clips:
+        raise UserError("None of the videos could be lined up with each other, so there is nothing to combine.")
+
+    stage(2, STAGES[2])
+    fuse_audio(project, log=log)
+
+    stage(3, STAGES[3])
+    video = render_video(project, size=s.size, log=log)
+    return {
+        "video": Path(video),
+        "folder": project.out_dir,
+        "minutes": sum(b - a for a, b in tl.segments()) / 60,
+        "used": len(tl.clips),
+        "skipped": len(tl.rejected),
+    }
+
+
+_PROGRESS = (
+    re.compile(r"^\[(\d+)/(\d+)\] (?:downloaded|FAILED)"),  # downloads
+    re.compile(r"(\d+)/(\d+) placed"),  # lining up
+    re.compile(r"^\s+(\d+)/(\d+)$"),  # rendering shots
+)
+
+
+def parse_progress(line: str) -> tuple[int, int] | None:
+    """(done, total) if a log line reports progress."""
+    for rx in _PROGRESS:
+        m = rx.search(line)
+        if m and int(m[2]) > 0:
+            return int(m[1]), int(m[2])
+    return None
+
+
+def friendly_error(exc: BaseException) -> str:
+    if isinstance(exc, UserError):
+        return str(exc)
+    if isinstance(exc, SystemExit):
+        return str(exc.code) if exc.code else "Stopped."
+    text = str(exc).lower()
+    if any(w in text for w in ("urlopen", "getaddrinfo", "timed out", "connection", "network", "resolve")):
+        return "I couldn't reach the internet. Please check your connection and try again."
+    return f"Something went wrong: {exc}"
+
+
+# ---------------------------------------------------------------- settings memory
+
+
+def _settings_path() -> Path:
+    return ytdlp.data_dir() / "settings.json"
+
+
+def load_saved() -> dict:
+    try:
+        return json.loads(_settings_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(s: Settings) -> None:
+    try:
+        _settings_path().write_text(
+            json.dumps({"folder": str(s.folder), "clips": s.clips, "quality": s.quality, "query": s.query}),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def shorten_path(text: str, limit: int = 56) -> str:
+    """Keep the start and end of a long path so it does not stretch the window."""
+    if len(text) <= limit:
+        return text
+    head = 18
+    return text[:head] + " ... " + text[-(limit - head - 5):]
+
+
+def icon_path() -> Path | None:
+    """meld.ico, next to the packaged app or in packaging/ when running from source."""
+    for base in (getattr(sys, "_MEIPASS", None), Path(__file__).resolve().parents[2] / "packaging"):
+        if base and (Path(base) / "meld.ico").exists():
+            return Path(base) / "meld.ico"
+    return None
+
+
+def default_folder() -> Path:
+    return Path.home() / "Documents" / "Meld"
+
+
+# ---------------------------------------------------------------- look and feel
+
+# Colours are taken from the app icon: a dark navy square with yellow and coral sound-wave bars.
+BG = "#12131c"
+SURFACE = "#1b1d2b"
+SURFACE2 = "#252838"
+SURFACE3 = "#30344c"
+SELECTED = "#3a3420"  # the chosen toggle button: a dark tint of the accent
+BORDER = "#333852"
+TEXT = "#eef0f8"
+MUTED = "#9399b8"
+ACCENT = "#ffd23f"
+ACCENT_HI = "#ffe07a"
+ACCENT_LO = "#e0b423"
+CORAL = "#ff785a"
+ON_ACCENT = "#1a1608"
+LOG_BG = "#0d0e15"
+ICON_BG = "#181a26"
+WAVE = [0.25, 0.55, 0.85, 0.5, 1.0, 0.6, 0.8, 0.4, 0.2]  # bar heights, same as packaging/make_icon.py
+
+
+def apply_theme(style, px) -> None:
+    """Dark theme on top of ttk's 'clam' (the only built-in theme that lets every colour be changed)."""
+    style.theme_use("clam")
+    style.configure(
+        ".", background=BG, foreground=TEXT, fieldbackground=SURFACE, bordercolor=BORDER, darkcolor=BORDER,
+        lightcolor=BORDER, troughcolor=SURFACE2, focuscolor=BORDER, insertcolor=ACCENT,
+        selectbackground=ACCENT, selectforeground=ON_ACCENT,
+    )
+    style.configure("TFrame", background=BG)
+    style.configure("Card.TFrame", background=SURFACE)
+    style.configure("TLabel", background=BG, foreground=TEXT)
+    style.configure("Card.TLabel", background=SURFACE)
+    style.configure("Title.TLabel", font=("Segoe UI", 26, "bold"))
+    style.configure("Hint.TLabel", foreground=MUTED)
+    style.configure("CardHint.TLabel", background=SURFACE, foreground=MUTED)
+    style.configure("Section.TLabel", foreground=MUTED, font=("Segoe UI", 9, "bold"))
+    style.configure("CardSection.TLabel", background=SURFACE, foreground=MUTED, font=("Segoe UI", 9, "bold"))
+    style.configure("Status.TLabel", background=SURFACE, font=("Segoe UI", 12, "bold"))
+    style.configure("Check.TLabel", background=SURFACE, foreground=ACCENT, font=("Segoe UI", 22, "bold"))
+    for name, colour in (("StepIdle", MUTED), ("StepNow", TEXT), ("StepDone", ACCENT)):
+        style.configure(f"{name}.TLabel", background=SURFACE, foreground=colour, font=("Segoe UI", 9, "bold" if name == "StepNow" else "normal"))
+
+    def flat_button(name, bg, fg, hover, pressed, pad, font, disabled_bg=SURFACE2, disabled_fg=MUTED, hover_fg=None):
+        style.configure(
+            name, background=bg, foreground=fg, bordercolor=bg, lightcolor=bg, darkcolor=bg, focuscolor=bg,
+            relief="flat", borderwidth=1, padding=pad, font=font,
+        )
+        states = [("disabled", disabled_bg), ("pressed", pressed), ("active", hover)]
+        style.map(
+            name,
+            background=states, bordercolor=states, lightcolor=states, darkcolor=states,
+            foreground=[("disabled", disabled_fg)] + ([("active", hover_fg)] if hover_fg else []),
+            relief=[("pressed", "flat")],
+        )
+
+    flat_button("Primary.TButton", ACCENT, ON_ACCENT, ACCENT_HI, ACCENT_LO, (px(26), px(11)), ("Segoe UI", 13, "bold"),
+                disabled_bg=SURFACE2, disabled_fg="#6b7090")
+    flat_button("Secondary.TButton", SURFACE2, TEXT, SURFACE3, BORDER, (px(18), px(10)), ("Segoe UI", 11), disabled_fg="#6b7090")
+    flat_button("Small.TButton", SURFACE2, TEXT, SURFACE3, BORDER, (px(14), px(6)), ("Segoe UI", 10))
+    flat_button("Chip.TButton", SURFACE, MUTED, SURFACE2, SURFACE3, (px(12), px(4)), ("Segoe UI", 10), hover_fg=TEXT)
+    flat_button("Link.TButton", BG, MUTED, BG, BG, (px(8), px(4)), ("Segoe UI", 10), disabled_bg=BG, hover_fg=ACCENT)
+
+    style.configure(
+        "Search.TEntry", fieldbackground=SURFACE, foreground=TEXT, padding=(px(14), px(10)), borderwidth=1,
+    )
+    focused = [("focus", ACCENT)]
+    style.map(
+        "Search.TEntry", bordercolor=focused, lightcolor=focused, darkcolor=focused,
+        fieldbackground=[("disabled", BG)], foreground=[("disabled", MUTED)],
+    )
+
+    # Radio buttons drawn as toggle buttons: ttk's own radio dot is a fixed-size bitmap that is tiny on high-DPI screens.
+    style.configure(
+        "Choice.Toolbutton", background=SURFACE2, foreground=TEXT, bordercolor=BORDER, lightcolor=SURFACE2,
+        darkcolor=SURFACE2, focuscolor=SURFACE2, relief="flat", borderwidth=1, padding=(px(14), px(7)),
+        font=("Segoe UI", 11),
+    )
+    state_bg = [("selected", SELECTED), ("active", SURFACE3)]
+    style.map(
+        "Choice.Toolbutton", background=state_bg, lightcolor=state_bg, darkcolor=state_bg,
+        bordercolor=[("selected", ACCENT), ("active", MUTED)], foreground=[("selected", ACCENT)],
+        relief=[("selected", "flat"), ("pressed", "flat")],
+    )
+
+    style.configure(
+        "Meld.Horizontal.TProgressbar", troughcolor=SURFACE2, background=ACCENT, bordercolor=SURFACE2,
+        lightcolor=ACCENT, darkcolor=ACCENT, thickness=px(8),
+    )
+    style.configure(
+        "Vertical.TScrollbar", background=SURFACE3, troughcolor=LOG_BG, bordercolor=LOG_BG, arrowcolor=MUTED,
+        lightcolor=SURFACE3, darkcolor=SURFACE3,
+    )
+    style.map("Vertical.TScrollbar", background=[("active", BORDER)])
+
+
+def draw_logo(canvas, size: int) -> None:
+    """The app icon, drawn with canvas primitives so no image library is needed at run time."""
+    r = size * 0.2
+    x1 = y1 = 1
+    x2 = y2 = size - 1
+    canvas.create_polygon(
+        x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r,
+        x1, y1 + r, x1, y1, smooth=True, fill=ICON_BG, outline=BORDER,
+    )
+    margin = size * 0.16
+    slot = (size - 2 * margin) / len(WAVE)
+    width = slot * 0.64
+    for i, h in enumerate(WAVE):
+        cx = margin + i * slot + slot / 2
+        half = max(0.0, size * 0.62 * h / 2 - width / 2)  # round caps add width/2 at both ends
+        canvas.create_line(
+            cx, size / 2 - half, cx, size / 2 + half, width=width, capstyle="round",
+            fill=ACCENT if i % 2 == 0 else CORAL,
+        )
+
+
+def style_titlebar(root) -> None:
+    """Dark title bar on Windows 10/11 (Windows 11 also gets the window's own colours); silently skipped elsewhere."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32, dwm = ctypes.windll.user32, ctypes.windll.dwmapi
+        user32.GetParent.restype = wintypes.HWND
+        user32.GetParent.argtypes = [wintypes.HWND]
+        dwm.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+        root.update_idletasks()
+        hwnd = user32.GetParent(root.winfo_id())
+
+        def colorref(hex_colour: str) -> int:  # 0x00BBGGRR
+            r, g, b = (int(hex_colour[i:i + 2], 16) for i in (1, 3, 5))
+            return (b << 16) | (g << 8) | r
+
+        for attr, value in ((20, 1), (35, colorref(BG)), (36, colorref(TEXT))):  # dark mode, caption, caption text
+            v = ctypes.c_int(value)
+            dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(v), ctypes.sizeof(v))
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- the window
+
+
+def main(hook=None) -> None:
+    """Open the window. `hook(root, widgets)` (tests only) is called once the window is up."""
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+    import tkinter.font as tkfont
+
+    # A windowed Windows app has no console: make print() harmless.
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name) is None:
+            setattr(sys, name, open(os.devnull, "w"))
+    try:
+        import ctypes
+
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # crisp text on high-DPI screens
+    except Exception:
+        pass
+
+    root = tk.Tk()
+    root.withdraw()  # shown once it is styled and placed, so it does not flash unstyled
+    root.title(APP_NAME)
+    root.configure(background=BG)
+    icon = icon_path()
+    if icon:
+        try:
+            root.iconbitmap(str(icon))
+        except tk.TclError:
+            pass
+
+    scale = root.winfo_fpixels("1i") / 96  # pixel sizes below are for a 96-dpi screen; fonts scale by themselves
+
+    def px(n: float) -> int:
+        return int(round(n * scale))
+
+    for font_name, size in (("TkDefaultFont", 11), ("TkTextFont", 11), ("TkMenuFont", 10)):
+        tkfont.nametofont(font_name).configure(family="Segoe UI", size=size)
+    style = ttk.Style()
+    apply_theme(style, px)
+
+    saved = load_saved()
+    q: "queue.Queue[tuple]" = queue.Queue()
+    cancel = threading.Event()
+    state = {"worker": None, "result": None}
+
+    query_var = tk.StringVar(value=saved.get("query", ""))
+    clips_var = tk.IntVar(value=saved.get("clips", 100))
+    quality_var = tk.IntVar(value=saved.get("quality", 720))
+    folder_var = tk.StringVar(value=saved.get("folder", str(default_folder())))
+    folder_shown = tk.StringVar(value=shorten_path(folder_var.get()))
+    folder_var.trace_add("write", lambda *_: folder_shown.set(shorten_path(folder_var.get())))
+    step_var = tk.StringVar(value=IDLE_TEXT)
+    detail_var = tk.StringVar(value="")
+    show_details = tk.BooleanVar(value=False)
+
+    def card(parent, border: str = BORDER, pad: int = 14):
+        """A rounded-looking panel: a 1 px border around a padded surface. Returns (outer, inner)."""
+        outer = tk.Frame(parent, background=SURFACE, highlightthickness=1, highlightbackground=border, highlightcolor=border)
+        inner = ttk.Frame(outer, style="Card.TFrame", padding=px(pad))
+        inner.pack(fill="both", expand=True)
+        return outer, inner
+
+    frm = ttk.Frame(root, padding=(px(28), px(16), px(28), px(10)))
+    frm.pack(fill="both", expand=True)
+    frm.columnconfigure(0, weight=1, minsize=px(680))
+    frm.rowconfigure(10, weight=1)  # the details box takes any extra height
+    wrapped: list[tuple[ttk.Label, int]] = []  # (label, pixels its wrap width stays short of the window's)
+
+    # -- header
+    header = ttk.Frame(frm)
+    header.grid(row=0, column=0, sticky="w")
+    logo = tk.Canvas(header, width=px(46), height=px(46), background=BG, highlightthickness=0)
+    draw_logo(logo, px(46))
+    logo.grid(row=0, column=0, padx=(0, px(14)))
+    ttk.Label(header, text=APP_NAME, style="Title.TLabel").grid(row=0, column=1, sticky="w")
+    intro = ttk.Label(
+        frm, justify="left", style="Hint.TLabel",
+        text="Type a band and a year (or a date). I'll look for phone videos of that concert online "
+             "and combine them into one video with better sound.",
+    )
+    intro.grid(row=1, column=0, sticky="w", pady=(px(8), px(12)))
+    wrapped.append((intro, px(56)))
+
+    # -- what to look for
+    entry = ttk.Entry(frm, textvariable=query_var, style="Search.TEntry", font=("Segoe UI", 14))
+    entry.grid(row=3, column=0, sticky="ew")
+
+    examples = ttk.Frame(frm)
+    examples.grid(row=4, column=0, sticky="w", pady=(px(6), px(14)))
+    ttk.Label(examples, text="Try", style="Hint.TLabel").pack(side="left", padx=(0, px(8)))
+
+    def use_example(text: str) -> None:
+        if str(entry["state"]) != "normal":
+            return
+        query_var.set(text)
+        entry.focus_set()
+        entry.icursor("end")
+
+    for text in EXAMPLES:
+        ttk.Button(examples, text=text, style="Chip.TButton", cursor="hand2", command=lambda t=text: use_example(t)).pack(
+            side="left", padx=(0, px(6))
+        )
+
+    # -- options
+    opts_card, opts = card(frm)
+    opts_card.grid(row=5, column=0, sticky="ew")
+    for row, (title, choices, var) in enumerate((
+        ("How many videos", CLIP_CHOICES, clips_var),
+        ("Picture quality", QUALITY_CHOICES, quality_var),
+    )):
+        ttk.Label(opts, text=title.upper(), style="CardSection.TLabel", width=17).grid(
+            row=row, column=0, sticky="w", padx=(0, px(12)), pady=(px(10) if row else 0, 0)
+        )
+        toggles = ttk.Frame(opts, style="Card.TFrame")
+        toggles.grid(row=row, column=1, sticky="w", pady=(px(10) if row else 0, 0))
+        for text, n in choices:
+            ttk.Radiobutton(toggles, text=text, value=n, variable=var, style="Choice.Toolbutton", cursor="hand2").pack(
+                side="left", padx=(0, px(8))
+            )
+
+    where = ttk.Frame(frm)
+    where.grid(row=6, column=0, sticky="ew", pady=(px(12), 0))
+    where.columnconfigure(1, weight=1)
+    ttk.Label(where, text="Save results in").grid(row=0, column=0, sticky="w")
+    ttk.Label(where, textvariable=folder_shown, style="Hint.TLabel").grid(row=0, column=1, sticky="w", padx=px(10))
+
+    def choose_folder() -> None:
+        d = filedialog.askdirectory(initialdir=folder_var.get() or str(Path.home()), title="Where should I save?")
+        if d:
+            folder_var.set(str(Path(d)))
+
+    ttk.Button(where, text="Change...", style="Small.TButton", cursor="hand2", command=choose_folder).grid(row=0, column=2)
+
+    buttons = ttk.Frame(frm)
+    buttons.grid(row=7, column=0, sticky="w", pady=(px(12), px(12)))
+    start_btn = ttk.Button(buttons, text="Start", style="Primary.TButton", cursor="hand2")
+    start_btn.pack(side="left")
+    cancel_btn = ttk.Button(buttons, text="Cancel", style="Secondary.TButton", cursor="hand2", state="disabled")
+    cancel_btn.pack(side="left", padx=px(12))
+
+    # -- progress: four steps, a status line, a bar and the latest detail
+    panel, panel_in = card(frm, pad=16)
+    panel.grid(row=8, column=0, sticky="new")
+    panel_in.columnconfigure(tuple(range(len(STEP_NAMES))), weight=1, uniform="steps")
+    step_bars: list[tuple[tk.Frame, ttk.Label]] = []
+    for i, name in enumerate(STEP_NAMES):
+        cell = ttk.Frame(panel_in, style="Card.TFrame")
+        cell.grid(row=0, column=i, sticky="ew", padx=(0, px(8)) if i < len(STEP_NAMES) - 1 else 0)
+        seg = tk.Frame(cell, height=px(4), background=SURFACE3)
+        seg.pack(fill="x")
+        label = ttk.Label(cell, text=name, style="StepIdle.TLabel")
+        label.pack(anchor="w", pady=(px(6), 0))
+        step_bars.append((seg, label))
+
+    def set_step(current: int) -> None:
+        """Steps before `current` are done, `current` is running, the rest wait. -1: none started, len: all done."""
+        for i, (seg, label) in enumerate(step_bars):
+            if i < current:
+                seg.configure(background=ACCENT)
+                label.configure(style="StepDone.TLabel", text="✓ " + STEP_NAMES[i])
+            elif i == current:
+                seg.configure(background=CORAL)
+                label.configure(style="StepNow.TLabel", text=STEP_NAMES[i])
+            else:
+                seg.configure(background=SURFACE3)
+                label.configure(style="StepIdle.TLabel", text=STEP_NAMES[i])
+
+    ttk.Label(panel_in, textvariable=step_var, style="Status.TLabel").grid(
+        row=1, column=0, columnspan=len(STEP_NAMES), sticky="w", pady=(px(14), px(8))
+    )
+    bar = ttk.Progressbar(panel_in, mode="determinate", maximum=100, style="Meld.Horizontal.TProgressbar")
+    bar.grid(row=2, column=0, columnspan=len(STEP_NAMES), sticky="ew")
+    detail_label = ttk.Label(panel_in, textvariable=detail_var, style="CardHint.TLabel", justify="left")
+    detail_label.grid(row=3, column=0, columnspan=len(STEP_NAMES), sticky="w", pady=(px(8), 0))
+    wrapped.append((detail_label, px(90)))
+
+    # -- result: replaces the progress panel when finished, so the window keeps its height
+    result_card, result_in = card(frm, border=ACCENT, pad=16)
+    result_card.grid(row=8, column=0, sticky="new")
+    result_card.grid_remove()
+    result_in.columnconfigure(1, weight=1)
+    ttk.Label(result_in, text="✓", style="Check.TLabel").grid(row=0, column=0, rowspan=2, sticky="n", padx=(0, px(14)))
+    ttk.Label(result_in, text="All done!", style="Status.TLabel").grid(row=0, column=1, sticky="w")
+    result_label = ttk.Label(result_in, style="Card.TLabel", font=("Segoe UI", 12), justify="left")
+    result_label.grid(row=1, column=1, sticky="w", pady=(px(4), 0))
+    wrapped.append((result_label, px(130)))
+    result_btns = ttk.Frame(result_in, style="Card.TFrame")
+    result_btns.grid(row=2, column=1, sticky="w", pady=(px(12), 0))
+    play_btn = ttk.Button(result_btns, text="Play the video", style="Primary.TButton", cursor="hand2")
+    play_btn.pack(side="left")
+    open_btn = ttk.Button(result_btns, text="Open the folder", style="Secondary.TButton", cursor="hand2")
+    open_btn.pack(side="left", padx=px(12))
+
+    # -- technical details (hidden until asked for)
+    log_frame = tk.Frame(frm, background=LOG_BG, highlightthickness=1, highlightbackground=BORDER, highlightcolor=BORDER)
+    log_text = tk.Text(
+        log_frame, height=6, wrap="word", state="disabled", font=("Consolas", 9), background=LOG_BG,
+        foreground="#c4c8de", insertbackground=ACCENT, selectbackground=SURFACE3, selectforeground=TEXT,
+        relief="flat", borderwidth=0, highlightthickness=0, padx=px(10), pady=px(8),
+    )
+    scroll = ttk.Scrollbar(log_frame, command=log_text.yview)
+    log_text.configure(yscrollcommand=scroll.set)
+    log_text.pack(side="left", fill="both", expand=True)
+    scroll.pack(side="right", fill="y")
+
+    footer = ttk.Frame(frm)
+    footer.grid(row=11, column=0, sticky="ew", pady=(px(12), 0))
+    footer.columnconfigure(1, weight=1)
+    # padding=0 on the outer edges so the link text lines up with the content above
+    details_btn = ttk.Button(footer, style="Link.TButton", cursor="hand2", text="Show details", padding=(0, px(4)))
+    details_btn.grid(row=0, column=0, sticky="w")
+    update_btn = ttk.Button(footer, style="Link.TButton", cursor="hand2", text="Update the YouTube downloader")
+    update_btn.grid(row=0, column=2)
+    about_btn = ttk.Button(footer, style="Link.TButton", cursor="hand2", text="About", padding=(px(8), px(4), 0, px(4)))
+    about_btn.grid(row=0, column=3)
+
+    def toggle_details() -> None:
+        show_details.set(not show_details.get())
+        if show_details.get():
+            log_frame.grid(row=10, column=0, sticky="nsew", pady=(px(14), 0))
+            details_btn.configure(text="Hide details")
+            root.update_idletasks()  # the window just grew: slide it up if it now runs off the bottom of the screen
+            overflow = root.winfo_y() + root.winfo_reqheight() - (root.winfo_screenheight() - px(60))
+            if overflow > 0:
+                root.geometry(f"+{root.winfo_x()}+{max(0, root.winfo_y() - overflow)}")
+        else:
+            log_frame.grid_remove()
+            details_btn.configure(text="Show details")
+
+    details_btn.configure(command=toggle_details)
+
+    def add_log(line: str) -> None:
+        log_text.configure(state="normal")
+        log_text.insert("end", line + "\n")
+        log_text.see("end")
+        log_text.configure(state="disabled")
+
+    def set_running(running: bool) -> None:
+        start_btn.configure(state="disabled" if running else "normal")
+        cancel_btn.configure(state="normal" if running else "disabled")
+        entry.configure(state="disabled" if running else "normal")
+
+    def worker(s: Settings) -> None:
+        s.project_dir.mkdir(parents=True, exist_ok=True)
+        logfile = open(s.project_dir / "meld.log", "a", encoding="utf-8", errors="replace")
+
+        def log(msg="") -> None:
+            if cancel.is_set():
+                raise Cancelled()
+            text = str(msg)
+            logfile.write(text + "\n")
+            logfile.flush()
+            q.put(("log", text))
+
+        def stage(i: int, name: str) -> None:
+            log(f"=== {name}")
+            q.put(("stage", i, name))
+
+        try:
+            q.put(("done", run_pipeline(s, log, stage)))
+        except Cancelled:
+            q.put(("cancelled",))
+        except BaseException as e:  # noqa: BLE001 - everything must reach the user
+            logfile.write(traceback.format_exc())
+            q.put(("error", friendly_error(e), traceback.format_exc()))
+        finally:
+            logfile.close()
+
+    def start() -> None:
+        query = query_var.get().strip()
+        if not query:
+            messagebox.showinfo(APP_NAME, "Please type which concert to look for, for example:  Metallica 2003")
+            entry.focus_set()
+            return
+        s = Settings(query, Path(folder_var.get()), clips_var.get(), quality_var.get())
+        try:
+            s.folder.mkdir(parents=True, exist_ok=True)
+            free = shutil.disk_usage(s.folder).free / 1024**3
+        except OSError as e:
+            messagebox.showerror(APP_NAME, f"I can't use that folder:\n{e}")
+            return
+        if free < s.disk_needed_gb() and not messagebox.askyesno(
+            APP_NAME,
+            f"This could need about {s.disk_needed_gb():.0f} GB, but only {free:.0f} GB is free on that drive.\n\n"
+            "Continue anyway? (Choosing fewer videos needs less space.)",
+        ):
+            return
+        save_settings(s)
+        cancel.clear()
+        state["result"] = None
+        result_label.configure(text="")
+        result_card.grid_remove()
+        panel.grid()
+        set_step(-1)
+        step_var.set("Starting...")
+        detail_var.set("")
+        bar.configure(mode="indeterminate")
+        bar.start(12)
+        set_running(True)
+        state["worker"] = threading.Thread(target=worker, args=(s,), daemon=True)
+        state["worker"].start()
+
+    def stop() -> None:
+        cancel.set()
+        cancel_btn.configure(state="disabled")
+        step_var.set("Stopping... (this can take a moment)")
+
+    def finish(text: str) -> None:
+        bar.stop()
+        bar.configure(mode="determinate", value=0)
+        set_running(False)
+        step_var.set(text)
+
+    def show_error(message: str, details: str) -> None:
+        finish("It stopped")
+        add_log(details)
+        messagebox.showerror(APP_NAME, message + "\n\n(Choose \"Show details\" for technical information.)")
+
+    def poll() -> None:
+        try:
+            while True:
+                msg = q.get_nowait()
+                kind = msg[0]
+                if kind == "stage":
+                    step_var.set(f"Step {msg[1] + 1} of {len(STAGES)}: {msg[2]}")
+                    set_step(msg[1])
+                    bar.stop()
+                    bar.configure(mode="indeterminate")
+                    bar.start(12)
+                elif kind == "log":
+                    add_log(msg[1])
+                    line = msg[1].strip()
+                    if line and not line.startswith("==="):
+                        detail_var.set(line[:140])
+                    prog = parse_progress(msg[1])
+                    if prog:
+                        bar.stop()
+                        bar.configure(mode="determinate", value=100 * prog[0] / prog[1])
+                elif kind == "done":
+                    r = msg[1]
+                    state["result"] = r
+                    finish("All done!")
+                    set_step(len(STAGES))
+                    bar.configure(value=100)
+                    detail_var.set("")
+                    result_label.configure(
+                        text=f"Made a {r['minutes']:.0f}-minute video from {r['used']} phone videos"
+                             + (f" ({r['skipped']} others didn't match and were left out)." if r["skipped"] else ".")
+                    )
+                    play_btn.configure(command=lambda p=r["video"]: os.startfile(p))
+                    open_btn.configure(command=lambda p=r["folder"]: os.startfile(p))
+                    panel.grid_remove()
+                    result_card.grid()
+                elif kind == "cancelled":
+                    finish("Stopped")
+                    detail_var.set("You can start again any time; videos already downloaded are kept.")
+                elif kind == "error":
+                    show_error(msg[1], msg[2])
+                elif kind == "info":
+                    detail_var.set("")
+                    messagebox.showinfo(APP_NAME, msg[1])
+        except queue.Empty:
+            pass
+        root.after(100, poll)
+
+    def on_close() -> None:
+        w = state["worker"]
+        if w is not None and w.is_alive() and not messagebox.askyesno(APP_NAME, "I'm still working. Stop and close?"):
+            return
+        cancel.set()
+        root.destroy()
+
+    def update_downloader() -> None:
+        def go() -> None:
+            try:
+                v = ytdlp.update(lambda *_: None)
+                q.put(("log", f"YouTube downloader updated to {v}."))
+                q.put(("info", f"The YouTube downloader is up to date ({v})."))
+            except Exception as e:  # noqa: BLE001
+                q.put(("error", friendly_error(e), traceback.format_exc()))
+
+        detail_var.set("Updating the YouTube downloader...")
+        threading.Thread(target=go, daemon=True).start()
+
+    def about() -> None:
+        messagebox.showinfo(
+            APP_NAME,
+            f"{APP_NAME}\n\nFinds phone videos of a concert, lines them up by their sound and combines them "
+            "into one video with the best sound.\n\nFor personal use only. Downloading videos from YouTube may go "
+            "against its terms, and concert footage is usually copyrighted.",
+        )
+
+    update_btn.configure(command=update_downloader)
+    about_btn.configure(command=about)
+    start_btn.configure(command=start)
+    cancel_btn.configure(command=stop)
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    root.bind("<Return>", lambda e: start() if str(start_btn["state"]) == "normal" else None)
+
+    # Keep the YouTube downloader fresh (YouTube breaks old versions); quietly ignore being offline.
+    def refresh_downloader() -> None:
+        try:
+            v = ytdlp.update_if_stale(14, lambda *_: None)
+            if v:
+                q.put(("log", f"YouTube downloader updated to {v}."))
+        except Exception:
+            pass
+
+    threading.Thread(target=refresh_downloader, daemon=True).start()
+
+    def fit_text(_event=None) -> None:
+        width = max(px(300), frm.winfo_width())
+        for label, margin in wrapped:
+            label.configure(wraplength=max(px(200), width - margin))
+
+    set_step(-1)
+    fit_text()
+    frm.bind("<Configure>", fit_text)
+    root.minsize(px(560), px(420))
+
+    # Place the finished window in the upper middle of the screen, then show it.
+    root.update_idletasks()
+    x = max(0, (root.winfo_screenwidth() - root.winfo_reqwidth()) // 2)
+    room = root.winfo_screenheight() - root.winfo_reqheight() - px(90)  # title bar and taskbar
+    y = max(0, room // 3)
+    root.geometry(f"+{x}+{y}")
+    style_titlebar(root)
+    root.deiconify()
+
+    root.after(100, poll)
+    if hook:
+        widgets = {
+            "query": query_var, "folder": folder_var, "clips": clips_var, "quality": quality_var,
+            "start": start_btn, "step": step_var, "detail": detail_var, "result": result_label, "play": play_btn,
+            "queue": q,
+        }
+        root.after(300, hook, root, widgets)
+    entry.focus_set()
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
