@@ -237,7 +237,9 @@ def test_unrelated_clips_that_score_in_the_middle_by_chance_are_not_joined(tmp_p
 
 
 def test_a_real_match_that_scores_in_the_middle_still_joins(tmp_path, monkeypatch):
-    _scores(monkeypatch, lambda lag, z: (lag, min(z, 15.0)))  # a noisy recording: real, but never over 15
+    # a noisy recording: real, but never over 22. (Over UNVERIFIED_Z, so that the last clip, which only one other is there
+    # with, is believed without anyone to confirm it; see test_outliers for what is asked of weaker matches.)
+    _scores(monkeypatch, lambda lag, z: (lag, min(z, 22.0)))
     tl = sync(project_with(tmp_path, TWO_CONCERTS))
     assert names(tl.clips) == {"a1": 0.0, "a2": 40.0, "a3": 80.0, "a4": 120.0}
     assert [names(g) for g in tl.others] == [{"b1": 0.0, "b2": 30.0, "b3": 70.0}]

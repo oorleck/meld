@@ -155,6 +155,17 @@ OWN_FIRST = 2  # ... but only after this many of the current clip's own: most cl
 POOL_MIN_CLIPS = 8  # worker processes take a moment to start: not worth it for fewer clips than this ...
 POOL_MIN_SECONDS = 20  # ... or for clips shorter than this on average (when the number of workers is left to us)
 
+# A weak match (below CONFIDENT_Z) is not enough to put a clip in a group: the rest of the group has to agree (see
+# `others_agree`, and `audit_groups` for what is done afterwards, when all that is known is known). Found in a real run: one
+# clip of another night joined a big group by a match of z=11.5 that no other clip could confirm; five more of that night
+# then joined it, and there was a false cluster at the end of the group.
+CORROBORATE_FROM = 3  # this applies when the group has at least this many clips (a small one costs little, and grows)
+CORROBORATORS = 6  # the most clips a joining clip is checked against (longest overlap first); one that agrees is enough
+MIN_CORROBORATION_OVERLAP = 10.0  # seconds two clips must be there together to be asked
+UNVERIFIED_Z = 20.0  # when no other clip is there to ask, a weak match this strong or stronger is believed
+AUDIT_MIN_GROUP = 4  # smaller groups are not audited
+AUDIT_MAX_SECONDS = 300.0  # of the time two clusters have in common, this much is listened to
+
 # ---------------------------------------------------------------- groups that grow side by side
 
 
@@ -179,10 +190,55 @@ class _Groups:
         self.home[name] = gid
         self.link[name] = (anchor, z)
 
-    def merge(self, into: int, other: int, shift: float) -> None:
+    def merge(self, into: int, other: int, shift: float, bridge: tuple[str, str, float] | None = None) -> None:
+        """Group `other` becomes part of `into`, its times moved by `shift`. `bridge` is (the clip that links them, its
+        match in `other`, that match's z): the links of `other` are turned round to hang from the bridging clip, so that
+        a group is always one tree of links, and it can be seen what hangs on what."""
         for name, offset in self.members.pop(other).items():
             self.members[into][name] = offset + shift
             self.home[name] = into
+        if bridge is not None:
+            u, q, z = bridge
+            self.reroot(q)
+            self.link[q] = (u, z)
+
+    def reroot(self, name: str) -> None:
+        """Make `name` the root of its tree of links: the links from it up to the old root are turned round."""
+        path = [name]
+        while self.link[path[-1]][0] is not None:
+            path.append(self.link[path[-1]][0])
+        zs = [self.link[n][1] for n in path]  # the z of each one's link to the one above it
+        for i in range(len(path) - 1):
+            self.link[path[i + 1]] = (path[i], zs[i])
+        self.link[name] = (None, None)
+
+    def children(self) -> dict[str, list[str]]:
+        out: dict[str, list[str]] = {}
+        for name, (anchor, _) in self.link.items():
+            if anchor is not None:
+                out.setdefault(anchor, []).append(name)
+        return out
+
+    def subtree(self, name: str) -> set[str]:
+        """`name` and every clip that hangs on it, however far down."""
+        kids, seen, todo = self.children(), {name}, [name]
+        while todo:
+            for k in kids.get(todo.pop(), ()):
+                if k not in seen:
+                    seen.add(k)
+                    todo.append(k)
+        return seen
+
+    def detach(self, names: set[str], root: str) -> int:
+        """Set the clips `names` apart as a group of their own, with `root` at the top of their links. Their times stay
+        as they were (a group's times are its own)."""
+        old = self.home[root]
+        gid, self._next = self._next, self._next + 1
+        self.members[gid] = {n: self.members[old].pop(n) for n in names}
+        for n in names:
+            self.home[n] = gid
+        self.link[root] = (None, None)
+        return gid
 
     def loose(self, name: str) -> bool:
         return len(self.members[self.home[name]]) == 1
@@ -200,6 +256,122 @@ class _Groups:
 
     def saved(self) -> tuple[list[dict], dict]:
         return [dict(m) for m in self.members.values()], {n: list(v) for n, v in self.link.items()}
+
+
+def _covering(names, offsets: dict, seconds: dict) -> list[tuple[float, float]]:
+    """The stretches of a group's time that at least one of the clips `names` is there for."""
+    spans = sorted((offsets[n], offsets[n] + seconds[n]) for n in names)
+    merged: list[list[float]] = []
+    for a, b in spans:
+        if merged and a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return [(a, b) for a, b in merged]
+
+
+def _longest_common(a: list[tuple[float, float]], b: list[tuple[float, float]]) -> tuple[float, float] | None:
+    """The longest stretch that is in both lists of stretches."""
+    best, i, j = None, 0, 0
+    while i < len(a) and j < len(b):
+        lo, hi = max(a[i][0], b[j][0]), min(a[i][1], b[j][1])
+        if hi > lo and (best is None or hi - lo > best[1] - best[0]):
+            best = (lo, hi)
+        if a[i][1] < b[j][1]:
+            i += 1
+        else:
+            j += 1
+    return best
+
+
+def _aggregate(names, offsets: dict, audio: dict, lo: float, hi: float) -> np.ndarray:
+    """All of the clips `names` in one signal, from `lo` to `hi` in the group's time: each is made as loud as the others
+    (one phone right by the stage must not drown the rest), and they are added where they are there. What the clips have
+    in common, the sound of the concert, adds up; what each has of its own (its noise, the crowd round it) does not."""
+    out = np.zeros(max(0, int(round((hi - lo) * AR))), np.float32)
+    for n in names:
+        a, x = offsets[n], audio[n]
+        s0, s1 = max(lo, a), min(hi, a + len(x) / AR)
+        if s1 - s0 < 0.5:
+            continue
+        seg = np.asarray(x[int(round((s0 - a) * AR)): int(round((s1 - a) * AR))], np.float32)
+        i0 = int(round((s0 - lo) * AR))
+        m = max(0, min(len(seg), len(out) - i0))
+        if m:
+            out[i0: i0 + m] += seg[:m] / (float(np.sqrt(np.mean(seg[:m] ** 2))) + 1e-9)
+    return out
+
+
+def clusters_agree(first, second, offsets: dict, audio: dict) -> bool | None:
+    """Do two sets of clips of one group sound the same where they are both there? All of each set is added up (so that
+    what they have in common stands out from what each has of its own), and the two sums are checked as a clip is (see
+    `support`): the same moment in every part of the time they have in common. None if there is not enough of that time
+    to say (one set is not there where the other is)."""
+    seconds = {n: len(audio[n]) / AR for n in list(first) + list(second)}
+    common = _longest_common(_covering(first, offsets, seconds), _covering(second, offsets, seconds))
+    if common is None or common[1] - common[0] < MIN_CORROBORATION_OVERLAP:
+        return None
+    lo, hi = common[0], min(common[1], common[0] + AUDIT_MAX_SECONDS)
+    scores = support(_aggregate(second, offsets, audio, lo, hi), _aggregate(first, offsets, audio, lo, hi), 0.0, AR)
+    if scores is None:
+        return None
+    return sum(v >= MIN_SUPPORT for v in scores) >= min(SUPPORT_PARTS, len(scores))
+
+
+def audit_groups(groups: "_Groups", audio: dict, log=print, on_change=None) -> int:
+    """Look at every group again, now that everything is known, and set apart the clusters that do not belong.
+
+    A cluster hangs from a link, and a link below CONFIDENT_Z may be a chance. Everything that hangs on it (the clip and
+    all clips that were lined up through it) is taken as one cluster, and added up; the rest of the group, less the
+    clip the link goes to (the link is what is in question), is added up too; and if the two do not sound the same where
+    they are both there, the cluster is set apart. If they are not both there at all (nothing else was filming while the
+    cluster was), it stays only if the link is UNVERIFIED_Z or more. The outermost links are looked at first, and what
+    hangs on a cluster that goes goes with it. Returns how many clusters were set apart."""
+    seconds = {n: len(x) / AR for n, x in audio.items()}
+    apart = 0
+    checked: set[tuple[str, int, int]] = set()  # (clip, size of its cluster, size of the rest): looked at, and found to agree
+    for gid in list(groups.members):
+        while True:
+            members = groups.members.get(gid, {})
+            if len(members) < AUDIT_MIN_GROUP:
+                break
+            depth: dict[str, int] = {}
+            for n in members:  # how far each is from the top of the links
+                d, x = 0, n
+                while groups.link[x][0] is not None:
+                    x, d = groups.link[x][0], d + 1
+                depth[n] = d
+            weak = sorted(
+                (n for n in members if groups.link[n][0] is not None and (groups.link[n][1] or 0.0) < CONFIDENT_Z),
+                key=lambda n: depth[n],
+            )
+            found = None
+            for c in weak:
+                anchor, z = groups.link[c]
+                cluster = groups.subtree(c)
+                rest = set(members) - cluster
+                if len(rest) < CORROBORATE_FROM or (c, len(cluster), len(rest)) in checked:
+                    continue
+                verdict = clusters_agree(cluster, rest - {anchor}, members, audio)
+                if verdict is True or (verdict is None and z >= UNVERIFIED_Z):
+                    checked.add((c, len(cluster), len(rest)))
+                    continue
+                found = (c, cluster, anchor, z, verdict)
+                break
+            if found is None:
+                break
+            c, cluster, anchor, z, verdict = found
+            groups.detach(cluster, c)
+            apart += 1
+            others = len(cluster) - 1
+            log(
+                f"  {c} and the {others} clip(s) that hang on it were set apart: their link to {anchor} is only z={z:.1f} and "
+                + ("the rest of the group does not sound like them where they are both there." if verdict is False
+                   else "nothing else in the group was there to agree with it.")
+            )
+            if on_change is not None:
+                on_change()
+    return apart
 
 
 def estimate_remaining_groups(
@@ -269,8 +441,14 @@ def _align_groups(
     - joins the group it matches best;
     - seeds a group of its own if it matches nothing;
     - if it matches two groups, it is the bridge between them: they become one.
+    A match below CONFIDENT_Z is only believed, for a group of CORROBORATE_FROM clips or more, if another clip of the
+    group that is there at the same time agrees with it (`others_agree`); a clip that only such a match ties to a group
+    is not placed in it. A weak match that carries a cluster in is the worst thing that can happen: one clip of another
+    night did, and five more of its night followed it in.
     Clips that matched nothing then get another look, against everything they have not met (a group of two only forms
-    when its clips meet). Returns the groups and the best z each clip reached.
+    when its clips meet). Last, with everything known, every cluster that hangs on a weak link is checked again as a
+    whole (`audit_groups`): what was believable early on may not be once more clips are there to say. Returns the groups
+    and the best z each clip reached.
 
     The comparisons are what takes the time. `comparer` may run several at once in worker processes: while one is
     looked at, the next ones the search would make (in the order it would make them) are already being computed. They
@@ -513,28 +691,64 @@ def _align_groups(
                 comparer.top_up(feed)
         return found
 
-    def place(u: str, found: dict[int, tuple[str, float, float]]) -> None:
-        main = max(found, key=lambda g: found[g][2])
-        p, lag, z = found[main]
+    def others_agree(u: str, offset: float, gid: int, exclude: set[str]) -> bool | None:
+        """Do clips of group `gid` other than `exclude`, that are there while u would be, agree with u being at `offset`?
+        One that does is enough. None if there is none to ask."""
+        members, dur_u = groups.members[gid], len(audio[u]) / AR
+        asked = sorted(
+            ((min(offset + dur_u, off + len(audio[m]) / AR) - max(offset, off), m) for m, off in members.items() if m not in exclude),
+            reverse=True,
+        )
+        asked = [m for overlap, m in asked if overlap >= MIN_CORROBORATION_OVERLAP][:CORROBORATORS]
+        if not asked:
+            return None
+        for m in asked:
+            scores = support(audio[m], audio[u], offset - members[m], AR)
+            if scores is not None and sum(v >= MIN_SUPPORT for v in scores) >= min(SUPPORT_PARTS, len(scores)):
+                return True
+        return False
+
+    def believable(u: str, gid: int, entry: tuple[str, float, float]) -> bool:
+        """Is u's best match in group `gid` to be believed? A strong one is. A weak one, to a group that is not small, is
+        if other clips of the group agree (as a real overlap does, and a chance, or another night of the same show, does not);
+        if there are none to ask, only a fairly strong one is."""
+        p, lag, z = entry
+        if z >= CONFIDENT_Z or len(groups.members[gid]) < CORROBORATE_FROM:
+            return True
+        verdict = others_agree(u, groups.members[gid][p] + lag, gid, {p})
+        if verdict is None:
+            return z >= UNVERIFIED_Z
+        return verdict
+
+    def place(u: str, found: dict[int, tuple[str, float, float]]) -> bool:
+        """Put u in the group it matches best, and join the others it matches into it, but only on matches that are to be
+        believed. Returns whether u was placed."""
+        good = {gid: e for gid, e in found.items() if believable(u, gid, e)}
+        for gid, (p, _, z) in found.items():
+            if gid not in good:
+                log(f"  {u}: its match with {p} (z={z:.1f}) is not backed up by anything else in the group: not placed there")
+        if not good:
+            return False
+        main = max(good, key=lambda g: good[g][2])
+        p, lag, z = good[main]
         offset = groups.members[main][p] + lag
         if u in groups.home:  # a loose clip: its one-clip group goes away
             del groups.members[groups.home.pop(u)]
         groups.add(main, u, offset, p, z)
         log(f"  placed {u} at {offset:+.3f}s (z={z:.1f}, via {p})")
-        for gid, (q, lag_q, _) in found.items():
+        for gid, (q, lag_q, z_q) in good.items():
             if gid != main:  # u lines up with this group too: it is the bridge, and the two groups become one
                 shift = (offset - lag_q) - groups.members[gid][q]
-                groups.merge(main, gid, shift)
+                groups.merge(main, gid, shift, bridge=(u, q, z_q))
                 log(f"  {u} links two groups (via {q}): they are one now")
+        return True
 
     emit()
     for i, u in enumerate(order):
         current, pending_from = u, i + 1
         emit()
         found = attach(u, tuple(order[i + 1: i + 1 + AHEAD_CLIPS])) if groups.members else {}
-        if found:
-            place(u, found)
-        else:
+        if not (found and place(u, found)):  # no match, or none that is to be believed: a group of its own to start with
             groups.seed(u)
         processed.append(u)
         emit()
@@ -551,8 +765,7 @@ def _align_groups(
                 current = u
                 emit()
                 found = attach(u, tuple(retry[i + 1: i + 1 + AHEAD_CLIPS]))
-                if found:
-                    place(u, found)
+                if found and place(u, found):
                     merged = True
                 emit()
             retried += 1
@@ -560,6 +773,9 @@ def _align_groups(
             break
     current = None
     emit()
+    apart = audit_groups(groups, audio, log, on_change=emit)  # with everything known, does every cluster belong where it is?
+    if apart:
+        log(f"{apart} cluster(s) were set apart.")
     log(
         f"Matching took {format_duration(time.perf_counter() - started)} ({done} comparisons"
         + (f", {reused} of them from before" if reused else "") + ")."
