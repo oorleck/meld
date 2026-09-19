@@ -1,6 +1,6 @@
 [project]
 name = "meld"
-version = "0.1.4"
+version = "0.1.5"
 description = "Find phone videos of the same concert, sync them on audio, and fuse them into one long video and audio track."
 readme = "README.md"
 requires-python = ">=3.10"
