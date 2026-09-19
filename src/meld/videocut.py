@@ -21,7 +21,7 @@ import math
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-from scipy.ndimage import uniform_filter1d
+from scipy.ndimage import median_filter, uniform_filter1d
 
 from . import beats as beatfinder
 from .media import ffmpeg_exe, iter_gray_frames, load_audio, run_ffmpeg
@@ -31,6 +31,17 @@ from .timeline import OUT_FPS, ClipEntry, Timeline
 GRID = 0.5  # seconds per planning step; equals 1 / ANALYSIS_FPS
 ANALYSIS_FPS = 2
 AN = 256
+
+# Still pictures: a video that is one picture held while the sound plays (cover art, a photo slideshow) is as sharp and as
+# well exposed as any, and would win the choice of angle over a phone that is really there. What tells them apart is how
+# much the picture changes from one moment to the next. Measured (mean grey-level change between frames 0.5 s apart):
+# eight real phone clips 22 to 38 at the median and never below 11 even in their quietest twentieth; a still picture 0.003;
+# a slideshow 0.000 between pictures. So there is room for the limits below.
+STATIC_MOTION = 0.8  # a picture that changes this little (grey levels) is taken to be a still: its score is scaled down to the floor ...
+LIVE_MOTION = 3.0  # ... and one that changes this much is not questioned; in between, the score is scaled in step
+STATIC_FLOOR = 0.1  # what a still's score is worth next to a moving picture of the same quality. Not nothing: where it is
+# the only angle there is, it is shown
+MOTION_WINDOW = 9  # steps (4.5 s) of which the median is taken, so that the jumps between the pictures of a slideshow do not count
 
 # cutting to the music
 MIN_CONFIDENCE = 0.25  # below this there is no beat to speak of (talk, applause, noise): cut by picture quality instead
@@ -63,21 +74,66 @@ def _frame_score(frame: np.ndarray) -> float:
     return sharp * exposure
 
 
-def score_clip(project: Project, entry: ClipEntry) -> np.ndarray:
+def analyse_clip(project: Project, entry: ClipEntry) -> tuple[np.ndarray, np.ndarray]:
+    """(quality, motion) of a clip at ANALYSIS_FPS: how sharp and well exposed the picture is at each step, and how much
+    it changed since the step before (mean grey-level difference: 0 for a picture that is held). One pass over the video."""
     path = project.clip_path(entry)
-    cache = project.cache_dir / "vscore" / f"{entry.file}.npy"
+    cache = project.cache_dir / "vscore" / f"{entry.file}.v2.npz"
     cache.parent.mkdir(parents=True, exist_ok=True)
     if cache.exists() and cache.stat().st_mtime >= path.stat().st_mtime:
-        return np.load(cache)
+        with np.load(cache) as z:
+            return z["quality"], z["motion"]
     res = min(1.0, (min(entry.width, entry.height) / 720) ** 0.5)
-    scores = np.array(
-        [_frame_score(fr) * res for fr in iter_gray_frames(path, ANALYSIS_FPS, AN, AN)], np.float32
-    )
-    np.save(cache, scores)
-    return scores
+    quality, motion, prev = [], [], None
+    for fr in iter_gray_frames(path, ANALYSIS_FPS, AN, AN):
+        quality.append(_frame_score(fr) * res)
+        f = fr.astype(np.float32)
+        motion.append(float(np.abs(f - prev).mean()) if prev is not None else None)
+        prev = f
+    quality = np.array(quality, np.float32)
+    known = [m for m in motion if m is not None]
+    motion = np.array([m if m is not None else (known[0] if known else 0.0) for m in motion], np.float32)  # the first: as the next
+    np.savez(cache, quality=quality, motion=motion)
+    return quality, motion
 
 
-def plan_segment(S, entries, vidx, t0, t1, min_shot, max_shot, margin, variety):
+def liveness(motion: np.ndarray) -> np.ndarray:
+    """How much a score is worth at each step for how much the picture changes there: 1 for a picture that is alive,
+    STATIC_FLOOR for a still, in step between. The median over MOTION_WINDOW steps, so that a slideshow, which changes now
+    and then, is a still all through."""
+    if not len(motion):
+        return np.ones(0, np.float32)
+    steady = median_filter(np.asarray(motion, np.float32), MOTION_WINDOW, mode="nearest")
+    alive = np.clip((steady - STATIC_MOTION) / (LIVE_MOTION - STATIC_MOTION), 0.0, 1.0)
+    return (STATIC_FLOOR + (1.0 - STATIC_FLOOR) * alive).astype(np.float32)
+
+
+def score_clip(project: Project, entry: ClipEntry) -> np.ndarray:
+    """How good each moment of a clip is to show: sharp and well exposed, and alive. A still picture is worth a tenth."""
+    quality, motion = analyse_clip(project, entry)
+    return quality * liveness(motion)
+
+
+def still_share(project: Project, entry: ClipEntry) -> float:
+    """The share of a clip that is a still picture (0 to 1)."""
+    _, motion = analyse_clip(project, entry)
+    return float((liveness(motion) <= STATIC_FLOOR + 1e-6).mean()) if len(motion) else 0.0
+
+
+STILL_BELOW = 0.25  # over a stretch, a clip whose liveness averages under this is a still picture there
+
+
+def _live_first(clips: list[int], alive, s0: int, s1: int) -> list[int]:
+    """`clips`, or, if some of them are alive over the steps s0 to s1, only those. A still picture is not an angle to cut to
+    while a phone is really filming: that it is not to be shown twice running would otherwise make the editor go back and
+    forth between the phone and the still, whatever the scores. Where nothing else is filming, it is what there is."""
+    if alive is None:
+        return clips
+    lively = [c for c in clips if float(alive[c, s0:max(s1, s0 + 1)].mean()) >= STILL_BELOW]
+    return lively or clips
+
+
+def plan_segment(S, entries, vidx, t0, t1, min_shot, max_shot, margin, variety, alive=None):
     """Greedy shot list for one segment: [(first_step, end_step, clip_index | None)]."""
     min_steps = max(1, round(min_shot / GRID))
     max_steps = max(min_steps + 1, round(max_shot / GRID))
@@ -90,7 +146,7 @@ def plan_segment(S, entries, vidx, t0, t1, min_shot, max_shot, margin, variety):
 
     for s in range(s_lo, s_hi):
         a, b = max(s * GRID, t0), min((s + 1) * GRID, t1)
-        av = [c for c in vidx if entries[c].offset <= a + 0.03 and entries[c].end >= b - 0.03]
+        av = _live_first([c for c in vidx if entries[c].offset <= a + 0.03 and entries[c].end >= b - 0.03], alive, s, s + 1)
 
         def adj(c):
             return S[c, s] * variety ** recent[-3:].count(c)
@@ -136,7 +192,7 @@ def target_shot(energy: float, rise: float, bpm: float, pace: float = 1.0) -> fl
     return seconds * (120.0 / min(max(bpm, 60.0), 200.0)) ** TEMPO_EXPONENT / max(pace, 1e-3)
 
 
-def plan_music(S, entries, vidx, t0, t1, bm, min_shot, max_shot, pace=1.0, lead=LEAD, variety=0.8):
+def plan_music(S, entries, vidx, t0, t1, bm, min_shot, max_shot, pace=1.0, lead=LEAD, variety=0.8, alive=None):
     """Shot list for one stretch of music, like plan_segment: [(first_step, end_step, clip_index | None)] (steps may be
     fractions, as cuts are on beats, not on the 0.5 s grid). Cuts are on the beats of `bm` (a BeatMap, seconds from t0).
 
@@ -179,12 +235,17 @@ def plan_music(S, entries, vidx, t0, t1, bm, min_shot, max_shot, pace=1.0, lead=
             if not av:
                 continue
             s0, s1 = steps(a, b)
+            av = _live_first(av, alive, s0, s1)
             quality = {c: float(S[c, s0:s1].mean()) for c in av}
             phase = meta[j][0]
-            options.append((j, m, d, unmusical + (0.0 if phase == 0 or j == last else 0.05 if phase == 2 else 0.35), quality))
+            lively = {c for c in quality if alive is None or float(alive[c, s0:max(s1, s0 + 1)].mean()) >= STILL_BELOW}
+            options.append((
+                j, m, d, unmusical + (0.0 if phase == 0 or j == last else 0.05 if phase == 2 else 0.35), quality, lively,
+            ))
         if not options:
             # nothing shows a whole beat-length: take the clip that lasts longest and cut where it ends
             here = [c for c in vidx if entries[c].offset <= a + 0.03 and entries[c].end > a + 0.25]
+            here = _live_first(here, alive, *steps(a, min(a + 1.0, t1)))
             if not here:
                 nxt = times[pos + 1]
                 shots.append((a / GRID, nxt / GRID, None))
@@ -201,14 +262,16 @@ def plan_music(S, entries, vidx, t0, t1, bm, min_shot, max_shot, pace=1.0, lead=
             recent.append(c)
             pos = j
             continue
-        best_q = max(q for *_, quals in options for q in quals.values()) or 1.0
+        best_q = max(q for *_, quals, _lively in options for q in quals.values()) or 1.0
         # never the same angle twice running when another could be shown, however much better this one looks
-        others = bool(recent) and any(c != recent[-1] for *_, quals in options for c in quals)
+        # (a still picture is not an angle, so it does not count as another to change to: a shot of one that is the only
+        # option long enough to run past the end of a phone would otherwise throw out every option with the phone)
+        others = bool(recent) and any(c != recent[-1] for *_, lively in options for c in lively)
         run = 0  # how many shots in a row have had the length of the last one
         while run < len(lengths) and lengths[-1 - run] == lengths[-1]:
             run += 1
         pick = None
-        for j, m, d, off, quals in options:
+        for j, m, d, off, quals, _lively in options:
             rhythm = RHYTHM_WEIGHT * math.log2(d / want) ** 2 + off
             if run >= 2 and m == lengths[-1]:
                 rhythm += 0.1 * run  # the third time running, and each one after: change it
@@ -322,11 +385,18 @@ def render_video(
     log(f"Scoring video quality of {len(vidx)} clip(s) ...")
     nsteps = int(math.ceil(tl.end / GRID)) + 2
     S = np.zeros((len(entries), nsteps), np.float32)
+    A = np.ones((len(entries), nsteps), np.float32)  # how alive each clip's picture is (1: it moves; low: a still picture)
     for c in vidx:
-        s = score_clip(project, entries[c])
+        quality, motion = analyse_clip(project, entries[c])
+        alive = liveness(motion)
         start = int(round(entries[c].offset / GRID))
-        n = min(len(s), nsteps - start)
-        S[c, start:start + n] = s[:n]
+        n = min(len(quality), nsteps - start)
+        S[c, start:start + n] = (quality * alive)[:n]
+        A[c, start:start + n] = alive[:n]
+    stills = [entries[c].file for c in vidx if still_share(project, entries[c]) > 0.5]
+    if stills:
+        log(f"{len(stills)} clip(s) are a still picture (nothing in them moves), so they count for a tenth and are only shown "
+            f"where no other angle is: " + ", ".join(stills[:6]) + (" ..." if len(stills) > 6 else ""))
     S = uniform_filter1d(S, 5, axis=1, mode="nearest")
 
     shots_dir = project.cache_dir / "shots"
@@ -343,11 +413,11 @@ def render_video(
         bm = maps[k] if k < len(maps) else None
         if bm is not None and bm.confidence >= MIN_CONFIDENCE and len(bm.beats) >= 4:
             lo, hi = shot_limits(min_shot, max_shot, pace, music=True)
-            plan = plan_music(S, entries, vidx, t0, t1, bm, lo, hi, pace, LEAD, variety)
+            plan = plan_music(S, entries, vidx, t0, t1, bm, lo, hi, pace, LEAD, variety, alive=A)
             music += 1
         else:
             lo, hi = shot_limits(min_shot, max_shot, pace, music=False)
-            plan = plan_segment(S, entries, vidx, t0, t1, lo, hi, margin, variety)
+            plan = plan_segment(S, entries, vidx, t0, t1, lo, hi, margin, variety, alive=A)
             plain += 1
         for a, b, clip in plan:
             fa = round((min(max(a * GRID, t0), t1) - t0) * OUT_FPS)

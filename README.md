@@ -215,7 +215,7 @@ with several phones at similar zoom, so it is left in and checked automatically.
   of frames early) and the shot length follows the music: about 0.8 s where it is loud and driving, up to about 4 s where
   it is calm, shorter still at a fast tempo, so a typical song is cut about every 1.7 s. Where there is no beat (a ballad,
   a crowd singing) a greedy editor cuts between angles in shots of 2 to 5 s. Either way the angle is chosen by picture
-  quality, never the same one twice running. `--cut-pace 2` cuts twice as often, `0.5` half as often, `--min-shot` and
+  quality, never the same one twice running. A clip that is a still picture (cover art, or a slideshow, with the sound) is as sharp as any and would win on picture quality alone, so it counts for a tenth and is never cut to while a phone is filming; it is shown only where nothing else is (the log says which clips it took for stills; a picture is a still if it hardly changes from one moment to the next, which no real phone footage measured does). `--cut-pace 2` cuts twice as often, `0.5` half as often, `--min-shot` and
   `--max-shot` set the limits, and `--no-beats` cuts by picture quality only. Vertical clips are fitted over a blurred
   background. Cuts land on exact frame boundaries so picture stays locked to the audio.
 - Time nobody recorded is skipped in both audio and video.
