@@ -11,6 +11,11 @@ import numpy as np
 
 _FFMPEG: str | None = None
 
+# Started from a windowed app (the installed Meld has no console), a console program such as ffmpeg is given a console
+# of its own, and where Windows Terminal is the default terminal that is a whole Terminal window, once per call:
+# hundreds of them in a run. This asks for no window at all. It is 0 (no effect) on every other system.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 def ffmpeg_exe() -> str:
     global _FFMPEG
@@ -24,7 +29,7 @@ def ffmpeg_exe() -> str:
 def run_ffmpeg(args: list) -> None:
     p = subprocess.run(
         [ffmpeg_exe(), "-hide_banner", "-v", "error", "-y", *map(str, args)],
-        capture_output=True,
+        capture_output=True, creationflags=NO_WINDOW,
     )
     if p.returncode:
         # a negative or huge code with no message means ffmpeg crashed rather than reporting an error
@@ -43,7 +48,7 @@ class MediaInfo:
 def probe(path: Path) -> MediaInfo:
     p = subprocess.run(
         [ffmpeg_exe(), "-hide_banner", "-i", str(path)],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW,
     )
     text = p.stderr
     duration = 0.0
@@ -93,7 +98,7 @@ def iter_gray_frames(path: Path, fps: float, width: int, height: int) -> Iterato
         "-vf", f"fps={fps}:start_time=0,scale={width}:{height},format=gray",
         "-f", "rawvideo", "-",
     ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
     size = width * height
     try:
         while True:
