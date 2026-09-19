@@ -3,6 +3,9 @@
 One lane per group of clips that line up, a bar for each clip where it sits in its group's time (with its title), the
 clips not sorted yet in a tray at the bottom, and a line between the two clips being compared with the score it got.
 Bars slide from the tray into their place as they are matched, and slide again when groups merge.
+
+The lanes are as big as they need to be and scroll, both ways: the wheel goes up and down, Shift+wheel sideways, Ctrl+wheel
+zooms the time scale, and dragging with the mouse pans. The headline and the tray stay in view while the lanes move.
 """
 from __future__ import annotations
 
@@ -11,6 +14,7 @@ import time
 import tkinter as tk
 from dataclasses import dataclass
 from tkinter import font as tkfont
+from tkinter import ttk
 
 from .matchview import Layout, MatchState, Metrics, clock, layout, make_labels
 
@@ -46,11 +50,19 @@ class MatchCanvas(tk.Canvas):
 
     FPS = 30
     EASE = 13.0  # how fast things move to where they belong (bigger = quicker)
+    ZOOM_STEP = 1.25  # per notch of the wheel
+    ZOOM_MAX = 24.0
+    WHEEL_PIXELS = 60  # how far one notch of the wheel scrolls (at 100% scale)
 
     def __init__(self, master, theme: Theme, scale: float = 1.0, height: int = 320, **kw):
-        super().__init__(master, height=height, bg=theme.bg, highlightthickness=0, bd=0, **kw)
+        super().__init__(
+            master, height=height, bg=theme.bg, highlightthickness=0, bd=0, xscrollcommand=self._xscrolled,
+            yscrollcommand=self._yscrolled, **kw,
+        )
         self.theme, self.k = theme, scale
         self.m = Metrics().scaled(scale)
+        self.zoom = 1.0
+        self.xbar = self.ybar = None  # the scrollbars, if the window has any: they are told where the view is
         self.f_head = tkfont.Font(family="Segoe UI", size=10, weight="bold")
         self.f_lane = tkfont.Font(family="Segoe UI", size=9, weight="bold")
         self.f_bar = tkfont.Font(family="Segoe UI", size=8)
@@ -64,14 +76,19 @@ class MatchCanvas(tk.Canvas):
         self._bars: dict[str, list[float]] = {}  # name -> [x, y, w, h] as drawn now, on their way to the layout's
         self._chips: dict[str, list[float]] = {}  # name -> [x, y, size]
         self._lanes: dict[int, list[float]] = {}  # lane index -> [y, h]
-        self._hits: list[tuple[float, float, float, float, str]] = []
-        self._hover: tuple[float, float, str] | None = None
+        self._hits: list[tuple[float, float, float, float, str, bool]] = []  # in the content; the last: stays in the view
+        self._hover: tuple[float, float, str] | None = None  # where the mouse is in the view, and what is there
         self._job: str | None = None
         self._last = time.monotonic()
         self._names_key: tuple = ()
         self.bind("<Configure>", lambda e: self._relayout())
         self.bind("<Motion>", self._on_motion)
         self.bind("<Leave>", self._on_leave)
+        self.bind("<MouseWheel>", lambda e: self._wheel(e, "y"))
+        self.bind("<Shift-MouseWheel>", lambda e: self._wheel(e, "x"))
+        self.bind("<Control-MouseWheel>", self._zoom_wheel)
+        self.bind("<ButtonPress-1>", lambda e: self.scan_mark(e.x, e.y))
+        self.bind("<B1-Motion>", self._pan)
         self.bind("<Destroy>", lambda e: self._stop())
         self._draw()
 
@@ -91,6 +108,9 @@ class MatchCanvas(tk.Canvas):
             self._bars.clear()
             self._chips.clear()
             self._lanes.clear()
+            self.zoom = 1.0
+            self.xview_moveto(0)
+            self.yview_moveto(0)
         self._relayout()
 
     def settle(self) -> None:
@@ -109,14 +129,18 @@ class MatchCanvas(tk.Canvas):
     def _relayout(self) -> None:
         w, h = self.winfo_width(), self.winfo_height()
         if self.state is None or w < 60 or h < 60:
+            self.configure(scrollregion=(0, 0, max(1, w), max(1, h)))
             self._draw()
             return
-        self.lay = layout(self.state, self.labels, self.titles, w, h, self.m)
-        # a bar that appears starts from the chip it was in the tray; a new lane starts where it will be
+        self.lay = layout(self.state, self.labels, self.titles, w, h, self.m, self.zoom)
+        self.zoom = self.lay.zoom
+        self.configure(scrollregion=(0, 0, self.lay.content_w, self.lay.content_h))
+        # a bar that appears starts from the chip it was in the tray (which is in the view); a new lane starts where it will be
+        oy = self.canvasy(0)
         for b in self.lay.bars:
             if b.name not in self._bars:
                 chip = self._chips.get(b.name)
-                self._bars[b.name] = [chip[0], chip[1], chip[2], chip[2]] if chip else [b.x, b.y, 0.0, b.h]
+                self._bars[b.name] = [chip[0], chip[1] + oy, chip[2], chip[2]] if chip else [b.x, b.y, 0.0, b.h]
         for c in self.lay.chips:
             self._chips.setdefault(c.name, [c.x, c.y, c.size])
         for ln in self.lay.lanes:
@@ -169,10 +193,59 @@ class MatchCanvas(tk.Canvas):
         if moving or pulsing:
             self._job = self.after(int(1000 / self.FPS), self._tick)
 
+    # ------------------------------------------------------------------ scrolling
+
+    def _xscrolled(self, first, last) -> None:
+        if self.xbar is not None:
+            self.xbar.set(first, last)
+        self._redraw()
+
+    def _yscrolled(self, first, last) -> None:
+        if self.ybar is not None:
+            self.ybar.set(first, last)
+        self._redraw()
+
+    def _redraw(self) -> None:
+        """What stays in the view (the headline, the tray) is drawn where the view is now, so it has to be drawn again."""
+        if self._job is None:  # otherwise the next tick does it
+            self._draw()
+
+    def _wheel(self, e, axis: str) -> None:
+        pixels = -e.delta / 120 * self.WHEEL_PIXELS * self.k  # (the wheel of some mice and pads turns in smaller steps)
+        if not self.lay:
+            return
+        if axis == "x":
+            self.xview_moveto((self.canvasx(0) + pixels) / self.lay.content_w)
+        else:
+            self.yview_moveto((self.canvasy(0) + pixels) / self.lay.content_h)
+
+    def _pan(self, e) -> None:
+        self.scan_dragto(e.x, e.y, gain=1)
+
+    def _zoom_wheel(self, e) -> None:
+        self.zoom_by(self.ZOOM_STEP ** (e.delta / 120), e.x)
+
+    def zoom_by(self, factor: float, at_x: float | None = None) -> None:
+        """Stretch the time scale by `factor`, keeping the time at `at_x` (in the view; default: its middle) where it is."""
+        if not self.lay:
+            return
+        at_x = self.winfo_width() / 2 if at_x is None else at_x
+        seconds = (self.canvasx(at_x) - self.m.pad) / self.lay.scale
+        self.zoom = min(self.ZOOM_MAX, self.zoom * factor)
+        self._relayout()
+        self.xview_moveto((self.m.pad + seconds * self.lay.scale - at_x) / self.lay.content_w)
+
     # ------------------------------------------------------------------ hover
 
+    def _hit_at(self, x: float, y: float) -> str | None:
+        """What is at (x, y) of the view."""
+        cx, cy = self.canvasx(x), self.canvasy(y)
+        lay = self.lay
+        in_band = lay is not None and (y < self.m.head_h or y >= lay.axis_y - 4)  # the headline and the tray cover the lanes
+        return next((n for x0, y0, x1, y1, n, pinned in reversed(self._hits) if x0 <= cx <= x1 and y0 <= cy <= y1 and (pinned or not in_band)), None)
+
     def _on_motion(self, e) -> None:
-        hit = next((n for x0, y0, x1, y1, n in reversed(self._hits) if x0 <= e.x <= x1 and y0 <= e.y <= y1), None)
+        hit = self._hit_at(e.x, e.y)
         new = (e.x, e.y, hit) if hit else None
         if new != self._hover:
             self._hover = new
@@ -200,34 +273,27 @@ class MatchCanvas(tk.Canvas):
         self.delete("all")
         self._hits = []
         w, h = self.winfo_width(), self.winfo_height()
+        ox, oy = self.canvasx(0), self.canvasy(0)  # where the view is: what stays in it is drawn there
         if self.lay is None or self.state is None:
             self.create_text(
-                w / 2, h / 2, text="The matching shows up here while the videos are sorted", fill=t.muted, font=self.f_lane,
+                ox + w / 2, oy + h / 2, text="The matching shows up here while the videos are sorted", fill=t.muted, font=self.f_lane,
             )
             return
         lay, m, s = self.lay, self.m, self.state
         pulse = 0.5 + 0.5 * math.sin(time.monotonic() * 6.0)
 
-        self.create_text(m.pad, m.head_h / 2 + 1, text=lay.headline, anchor="w", fill=t.text, font=self.f_head)
-        extra = []
-        if lay.hidden_lanes:
-            extra.append(f"+{lay.hidden_lanes} more group{'s' if lay.hidden_lanes != 1 else ''}")
-        if extra:
-            self.create_text(w - m.pad, m.head_h / 2 + 1, text="  ".join(extra), anchor="e", fill=t.muted, font=self.f_small)
-
         # time marks behind the lanes
-        for x, text in lay.ticks:
-            self.create_line(x, m.head_h, x, lay.axis_y, fill=t.border, dash=(1, 5))
-            self.create_text(x + 3, lay.axis_y + m.axis_h / 2, text=text, anchor="w", fill=t.muted, font=self.f_small)
+        for x, _ in lay.ticks:
+            self.create_line(x, oy + m.head_h, x, oy + lay.axis_y, fill=t.border, dash=(1, 5))
 
         # lanes
         for ln in lay.lanes:
             y, hh = self._lanes.get(ln.index, [ln.y, ln.h])
             fill = mix(t.surface, t.bg, 0.55) if ln.dim else t.surface
             edge = t.accent if ln.chosen else (mix(t.border, t.bg, 0.5) if ln.dim else t.border)
-            self._round(m.pad - 6, y, w - m.pad + 6, y + hh, 8 * self.k, fill=fill, outline=edge, width=2 if ln.chosen else 1)
-            self.create_text(
-                m.pad + 2, y + m.lane_head_h / 2 + 1, text=ln.label, anchor="w",
+            self._round(m.pad - 6, y, lay.content_w - m.pad + 6, y + hh, 8 * self.k, fill=fill, outline=edge, width=2 if ln.chosen else 1)
+            self.create_text(  # its name stays at the left edge of the view while its lane goes on beyond
+                max(m.pad, ox + m.pad) + 2, y + m.lane_head_h / 2 + 1, text=ln.label, anchor="w",
                 fill=t.muted if ln.dim else (t.accent if ln.chosen else t.text), font=self.f_lane,
             )
 
@@ -248,19 +314,31 @@ class MatchCanvas(tk.Canvas):
             if b.label and bh >= 11 * self.k and bw >= 0.7 * b.w:
                 font = self.f_bar_huge if bh >= 30 * self.k else self.f_bar_big if bh >= 21 * self.k else self.f_bar
                 dim = b.lane in dim_lanes
-                self.create_text(
-                    x + 6 * self.k, y + bh / 2, text=b.label, anchor="w", font=font,
+                pad = 6 * self.k
+                self.create_text(  # the label slides along with the view, as long as its bar does
+                    max(x + pad, min(ox + pad, x + bw - font.measure(b.label) - pad)), y + bh / 2, text=b.label, anchor="w", font=font,
                     fill=mix(t.muted, t.bg, 0.35) if dim else t.on_bar,
                 )
-            self._hits.append((x, y, x + bw, y + bh, b.name))
+            self._hits.append((x, y, x + bw, y + bh, b.name, False))
+
+        # the headline on top and the tray below cover the lanes as these move past them
+        self.create_rectangle(ox - 1, oy - 1, ox + w + 1, oy + m.head_h, fill=t.bg, outline="")
+        self.create_rectangle(ox - 1, oy + lay.axis_y - 4, ox + w + 1, oy + h + 1, fill=t.bg, outline="")
+        self.create_text(ox + m.pad, oy + m.head_h / 2 + 1, text=lay.headline, anchor="w", fill=t.text, font=self.f_head)
+        if w >= 640 * self.k:
+            self.create_text(
+                ox + w - m.pad, oy + m.head_h / 2 + 1, anchor="e", fill=t.muted, font=self.f_small,
+                text="wheel: scroll  ·  Shift+wheel: sideways  ·  Ctrl+wheel: zoom  ·  drag: move",
+            )
+        for x, text in lay.ticks:
+            self.create_text(x + 3, oy + lay.axis_y + m.axis_h / 2, text=text, anchor="w", fill=t.muted, font=self.f_small)
 
         # the tray
-        self.create_line(m.pad, lay.tray_y, w - m.pad, lay.tray_y, fill=t.border)
+        self.create_line(ox + m.pad, oy + lay.tray_y, ox + w - m.pad, oy + lay.tray_y, fill=t.border)
         row1, row2 = lay.tray_y + 6, lay.tray_y + 6 + m.chip + 16
-        self.create_text(m.pad, row1 + m.chip / 2, text=f"Waiting {lay.waiting}" if lay.waiting else "Waiting", anchor="w", fill=t.muted, font=self.f_small)
-        self.create_text(m.pad, row2 + m.chip / 2, text=f"No match {lay.unmatched}" if lay.unmatched else "No match", anchor="w", fill=t.muted, font=self.f_small)
         for c in lay.chips:
             x, y, size = self._chips.get(c.name, [c.x, c.y, c.size])
+            y += oy
             if c.kind == "current":
                 g = (2 + 3 * pulse) * self.k
                 self._round(x - g, y - g, x + size + g, y + size + g, 4 * self.k, fill=mix(t.surface, t.accent, 0.3 + 0.3 * pulse), outline="")
@@ -269,13 +347,10 @@ class MatchCanvas(tk.Canvas):
                 self._round(x, y, x + size, y + size, 2 * self.k, fill=mix(t.bad, t.bg, 0.55), outline=mix(t.bad, t.bg, 0.25))
             else:
                 self._round(x, y, x + size, y + size, 2 * self.k, fill=mix(self._bar_colour(c.name), t.bg, 0.6), outline="")
-            self._hits.append((x, y, x + size, y + size, c.name))
-        for kind, row_y in (("waiting", row1), ("unmatched", row2)):
-            n = lay.hidden_chips.get(kind)
-            if n:
-                shown = [c for c in lay.chips if c.kind == kind]
-                x0 = (max(c.x for c in shown) + m.chip + m.chip_gap * 2) if shown else m.pad + 80 * self.k
-                self.create_text(x0, row_y + m.chip / 2, text=f"+{n}", anchor="w", fill=t.muted, font=self.f_small)
+            self._hits.append((x, y, x + size, y + size, c.name, True))
+        self.create_rectangle(ox - 1, oy + lay.tray_y + 1, ox + m.pad + m.label_w - 4 * self.k, oy + h + 1, fill=t.bg, outline="")
+        self.create_text(ox + m.pad, oy + row1 + m.chip / 2, text=f"Waiting {lay.waiting}" if lay.waiting else "Waiting", anchor="w", fill=t.muted, font=self.f_small)
+        self.create_text(ox + m.pad, oy + row2 + m.chip / 2, text=f"No match {lay.unmatched}" if lay.unmatched else "No match", anchor="w", fill=t.muted, font=self.f_small)
 
         # the comparison going on
         if link:
@@ -294,8 +369,10 @@ class MatchCanvas(tk.Canvas):
                 self._round(x0 - 4, y0 - 1, x1 + 4, y1 + 1, 4 * self.k, fill=t.bg, outline="")
                 self.tag_raise(tid)
 
-        if self._hover and self._hover[2]:
-            self._tooltip(*self._hover)
+        if self._hover:
+            name = self._hit_at(self._hover[0], self._hover[1])  # the view may have moved under the mouse
+            if name:
+                self._tooltip(self.canvasx(self._hover[0]), self.canvasy(self._hover[1]), name)
 
     def _where(self, name: str) -> tuple[float, float] | None:
         """The middle of a clip's bar, or of its chip in the tray."""
@@ -304,7 +381,7 @@ class MatchCanvas(tk.Canvas):
             return x + w / 2, y + h / 2
         if name in self._chips:
             x, y, size = self._chips[name]
-            return x + size / 2, y + size / 2
+            return x + size / 2, self.canvasy(0) + y + size / 2
         return None
 
     def _tooltip(self, mx: float, my: float, name: str) -> None:
@@ -317,11 +394,36 @@ class MatchCanvas(tk.Canvas):
         a = self.create_text(mx + 14, my + 16, text=title, anchor="nw", fill=t.text, font=self.f_lane)
         b = self.create_text(mx + 14, my + 16 + self.f_lane.metrics("linespace") + 2, text=detail, anchor="nw", fill=t.muted, font=self.f_small)
         x0, y0, x1, y1 = self.bbox(a, b)
-        dx = min(0, self.winfo_width() - 8 - (x1 + 8))  # keep it inside the view
-        dy = min(0, self.winfo_height() - 4 - (y1 + 6))
+        dx = min(0, self.canvasx(self.winfo_width()) - 8 - (x1 + 8))  # keep it inside the view
+        dy = min(0, self.canvasy(self.winfo_height()) - 4 - (y1 + 6))
         if dx or dy:
             self.move(a, dx, dy)
             self.move(b, dx, dy)
             x0, y0, x1, y1 = self.bbox(a, b)
         box = self._round(x0 - 8, y0 - 5, x1 + 8, y1 + 5, 6 * self.k, fill=t.surface2, outline=t.border)
         self.tag_lower(box, a)
+
+
+class MatchPanel(tk.Frame):
+    """A MatchCanvas with a scrollbar down its side and along its foot. It stands in for the canvas: `set_state()` and
+    `settle()` are the canvas's. The bars are always there (not shown only when needed), so that the canvas keeps its
+    size as a lane grows or the window is resized, and nothing shifts about."""
+
+    def __init__(self, master, theme: Theme, scale: float = 1.0, height: int = 320, bar_style: str = "", **kw):
+        super().__init__(master, bg=theme.bg, **kw)
+        style = (lambda orient: {"style": f"{bar_style}.{orient}.TScrollbar"}) if bar_style else (lambda orient: {})
+        self.canvas = MatchCanvas(self, theme, scale, height=height)
+        self.xbar = ttk.Scrollbar(self, orient="horizontal", command=self.canvas.xview, **style("Horizontal"))
+        self.ybar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview, **style("Vertical"))
+        self.canvas.xbar, self.canvas.ybar = self.xbar, self.ybar
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.ybar.grid(row=0, column=1, sticky="ns")
+        self.xbar.grid(row=1, column=0, sticky="ew")
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+    def set_state(self, state: MatchState | None, titles: dict[str, str] | None = None) -> None:
+        self.canvas.set_state(state, titles)
+
+    def settle(self) -> None:
+        self.canvas.settle()

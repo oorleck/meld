@@ -80,7 +80,10 @@ optional desktop one) and shows a personal-use notice. An installed copy can be 
   the sorting is over, every cluster that hangs on a weaker link is looked at again as a whole (all its clips added up,
   and the rest of the group added up, and the two must sound the same where both are there) and set apart if it does
   not: the log says which and why. When sorting is over the group that is used is
-  outlined. Hover a bar for its whole title. Close the window any time; **Show matching** in the footer brings it back.
+  outlined. Hover a bar for its whole title. Every group and every waiting video is shown, however many there are:
+  the wheel scrolls the timelines up and down, Shift+wheel sideways, Ctrl+wheel zooms the time scale (a long show
+  is wider than the window until you zoom out), and dragging moves them; the headline and the tray stay in view.
+  Close the window any time; **Show matching** in the footer brings it back.
 - **Strict search (optional).** By default a video is kept if its title (or channel name) has each word you typed, at
   the start of a word, and does not name a different date; words such as "live" and "show" are not asked for, and a title
   with no date is kept. Tick **Strict: the title must have every word I typed** and it is much fussier: every word must

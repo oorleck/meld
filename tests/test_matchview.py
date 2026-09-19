@@ -207,7 +207,7 @@ def test_an_empty_state_says_it_is_waiting():
 
 def test_bars_are_labelled_when_they_are_wide_enough_and_shortened_with_an_ellipsis():
     titles = {"a.m4a": "Alpha Song Number One With A Very Long Title", "b.m4a": "B", "c.m4a": "C"}
-    out = lay(state([{"a.m4a": 0.0, "b.m4a": 4000.0}], durations={"a.m4a": 600.0, "b.m4a": 5.0}), titles)
+    out = lay(state([{"a.m4a": 0.0, "b.m4a": 4000.0}], durations={"a.m4a": 300.0, "b.m4a": 5.0}), titles)
     bars = {b.name: b for b in out.bars}
     assert bars["a.m4a"].label.startswith("Alpha Song") and bars["a.m4a"].label.endswith("…")  # cut to fit
     assert bars["b.m4a"].label == "" and bars["b.m4a"].title == "B"  # too narrow to write on; hover shows it
@@ -220,56 +220,76 @@ def test_time_marks_are_far_enough_apart_to_read():
     assert len({text for _, text in out.ticks}) == len(out.ticks)  # each mark reads differently
 
 
-def test_a_long_queue_shows_what_fits_and_counts_the_rest():
+def test_a_long_queue_is_all_there_in_a_tray_that_goes_on_sideways():
     pending = [f"w{i}.m4a" for i in range(300)]
     out = lay(state([{"a.m4a": 0, "b.m4a": 30}], pending=pending))
     shown = [c for c in out.chips if c.kind == "waiting"]
-    assert 0 < len(shown) < 300 and out.hidden_chips["waiting"] == 300 - len(shown)
-    assert all(c.x + c.size <= out.width for c in shown)
+    assert len(shown) == 300 and out.waiting == 300  # none left out
+    assert out.content_w > out.width and all(c.x + c.size <= out.content_w for c in shown)  # the content is as wide as they need
 
 
-def test_more_groups_than_fit_are_counted_not_drawn_off_the_edge():
+def test_more_groups_than_fit_the_view_are_all_there_and_the_content_grows_taller_to_scroll():
     groups = [{f"g{k}a.m4a": 0, f"g{k}b.m4a": 40, f"g{k}c.m4a": 80} for k in range(12)]
     out = lay(state(groups), height=300)
-    assert out.hidden_lanes > 0 and len(out.lanes) + out.hidden_lanes == 12
+    assert len(out.lanes) == 12  # none hidden
+    assert out.content_h > out.height and out.lanes[-1].y + out.lanes[-1].h == pytest.approx(out.lanes_bottom)
+    assert out.lanes_bottom <= out.content_h - (out.height - out.axis_y)  # the last one can be scrolled clear of the tray
     assert fit_check(out) == []
-    assert out.lanes[-1].y + out.lanes[-1].h <= out.axis_y
+    assert out.tray_y == out.height - Metrics().tray_h  # the tray and the headline stay in the view: not in the content
 
 
-def test_a_group_with_many_overlapping_clips_gets_thinner_bars_to_fit():
-    crowded = {f"c{i}.m4a": float(i) for i in range(20)}  # twenty clips all at once: twenty rows
+def test_a_group_with_many_overlapping_clips_keeps_readable_bars_and_scrolls():
+    crowded = {f"c{i}.m4a": float(i) for i in range(80)}  # eighty clips all at once: eighty rows
     out = lay(state([crowded]), height=300)
-    assert Metrics().min_bar_h <= out.bars[0].h < Metrics().bar_h
-    assert fit_check(out) == []
+    assert len(out.bars) == 80 and all(b.h == Metrics().bar_h for b in out.bars)  # not thinned to nothing, not left out
+    assert out.content_h > 80 * Metrics().bar_h and fit_check(out) == []
 
 
-def test_a_crowd_too_big_for_the_panel_is_cut_and_counted_not_drawn_off_the_edge():
-    crowd = {f"c{i}.m4a": float(i) for i in range(80)}  # eighty clips at once: more rows than any bar can be thin enough for
-    out = lay(state([crowd]), height=300)
-    assert out.hidden_bars > 0 and len(out.bars) + out.hidden_bars == 80
-    assert "not shown" in out.lanes[0].label and fit_check(out) == []
-    assert out.lanes[0].y + out.lanes[0].h <= out.axis_y
+def test_a_view_with_room_to_spare_is_not_made_larger_than_it_is():
+    out = lay(state([{"a.m4a": 0, "b.m4a": 30}]), width=900, height=600)
+    assert (out.content_w, out.content_h) == (900, 600)  # nothing to scroll to
+
+
+def test_a_long_group_is_kept_readable_and_scrolls_sideways_instead_of_being_squeezed_in():
+    st = state([{"a.m4a": 0.0, "b.m4a": 5000.0}], durations={"a.m4a": 1200.0, "b.m4a": 1200.0})  # 6200 s
+    out = lay(st, width=900)
+    assert out.scale == pytest.approx(Metrics().min_scale) and out.content_w == pytest.approx(2 * Metrics().pad + 6200 * out.scale)
+    assert out.content_w > 900 and fit_check(out) == []
+    short = lay(state([{"a.m4a": 0.0, "b.m4a": 50.0}], durations={"a.m4a": 100.0, "b.m4a": 100.0}), width=900)
+    assert short.scale > Metrics().min_scale and short.content_w == 900  # a short one is stretched to the view, as before
+
+
+def test_zooming_stretches_the_time_scale_and_zooming_out_stops_at_the_whole_group_in_view():
+    st = state([{"a.m4a": 0.0, "b.m4a": 5000.0}], durations={"a.m4a": 1200.0, "b.m4a": 1200.0})
+    usual, closer, further = lay(st, width=900), lay(st, width=900, zoom=4), lay(st, width=900, zoom=0.001)
+    assert closer.scale == pytest.approx(4 * usual.scale) and closer.zoom == pytest.approx(4)
+    assert further.content_w == 900 and further.zoom < 1  # all of it in view, and no further
+    assert closer.content_w > usual.content_w > further.content_w
+    huge = lay(st, width=900, zoom=1e9)
+    assert huge.content_w <= 60100  # however far one zooms, the content stays a size a canvas copes with
 
 
 def test_time_mark_text():
     assert [tick_text(t) for t in (0, 30, 60, 90, 600, 3600, 3900)] == ["0:00", "0:30", "1:00", "1:30", "10:00", "1:00:00", "1:05:00"]
 
 
-def test_bars_grow_thicker_when_the_panel_has_room_to_spare():
+def test_bars_grow_thicker_when_the_panel_has_room_to_spare_and_stay_a_readable_size_when_it_has_not():
     st = state([{"a.m4a": 0, "b.m4a": 30, "c.m4a": 70}])
-    cramped, roomy, tall = lay(st, height=200), lay(st, height=320), lay(st, height=900)
-    assert Metrics().min_bar_h <= cramped.bars[0].h < roomy.bars[0].h  # the more room, the thicker
-    assert Metrics().bar_h < tall.bars[0].h == Metrics().max_bar_h  # up to a limit
+    cramped, roomy, tall = lay(st, height=150), lay(st, height=320), lay(st, height=900)
+    assert cramped.bars[0].h == Metrics().bar_h < roomy.bars[0].h  # no room: the usual size, and the content scrolls
+    assert cramped.content_h > cramped.height
+    assert Metrics().bar_h < tall.bars[0].h == Metrics().max_bar_h  # the more room, the thicker, up to a limit
     assert all(fit_check(x) == [] for x in (cramped, roomy, tall))
 
 
-def test_thicker_bars_never_cost_a_lane_its_place():
+def test_thicker_bars_never_make_what_would_have_fitted_scroll():
     groups = [{f"g{k}a.m4a": 0, f"g{k}b.m4a": 40, f"g{k}c.m4a": 80} for k in range(12)]
     for height in range(260, 900, 40):
         st = state(groups)
         plain = lay(st, height=height, m=Metrics(max_bar_h=Metrics().bar_h))  # no growing
         grown = lay(st, height=height)
-        assert len(grown.lanes) >= len(plain.lanes) and fit_check(grown) == []
+        assert (grown.content_h == height) or plain.content_h > height  # it fitted with the usual bars: it fits with these
+        assert fit_check(grown) == []
 
 
 def test_the_tray_labels_get_the_room_they_need_on_a_sharper_screen():

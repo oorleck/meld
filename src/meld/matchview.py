@@ -42,6 +42,7 @@ class Metrics:
     min_bar_h: float = 7
     max_bar_h: float = 34  # bars grow this thick when there is room to spare
     label_w: float = 74  # room for the words in front of each row of chips in the tray
+    min_scale: float = 0.5  # pixels per second: the least a group is stretched to (a longer one scrolls sideways)
     bar_gap: float = 3
     lane_gap: float = 10
     axis_h: float = 18
@@ -105,18 +106,24 @@ class Link:
 
 @dataclass
 class Layout:
+    """Where everything goes. `width` x `height` is the window's view. The lanes, their bars and the time marks are in
+    the content, which is as big as it needs to be (`content_w` x `content_h`, never less than the view) and scrolls;
+    the headline on top and the tray below (`tray_y`, `axis_y`, the chips' y) stay in the view, whatever is scrolled to,
+    so their y is where they are in the view. The chips' x is in the content: a long queue scrolls sideways."""
+
     width: float
     height: float
+    content_w: float = 0.0
+    content_h: float = 0.0
     lanes: list[Lane] = field(default_factory=list)
     bars: list[Bar] = field(default_factory=list)
     chips: list[Chip] = field(default_factory=list)
-    hidden_lanes: int = 0  # groups that did not fit
-    hidden_bars: int = 0  # clips of the first group that did not fit, even with the thinnest bars
-    hidden_chips: dict[str, int] = field(default_factory=dict)  # kind -> how many did not fit
     ticks: list[tuple[float, str]] = field(default_factory=list)
     axis_y: float = 0.0
     tray_y: float = 0.0
+    lanes_bottom: float = 0.0  # where the last lane ends, in the content
     scale: float = 0.0  # pixels per second
+    zoom: float = 1.0  # how much of the usual scale that is (below 1: shrunk, down to the whole group in view)
     waiting: int = 0
     unmatched: int = 0
     headline: str = ""
@@ -132,6 +139,7 @@ def clock(seconds: float) -> str:
     return f"{m} min" if m < 60 else f"{m // 60} h {m % 60:02d} min"
 
 
+MAX_CONTENT = 60000.0  # pixels: the widest the content is stretched to, however far one zooms in
 _STEPS = [10, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 14400]
 _WORD = re.compile(r"[\w'’&]+")
 _REMARK = re.compile(r"\([^)]*\)|\[[^\]]*\]")  # (Live at Wembley 2025), [4K]
@@ -205,8 +213,9 @@ def _ticks(scale: float, span: float, m: Metrics, x0: float) -> list[tuple[float
 
 def layout(
     state: MatchState, labels: dict[str, str], titles: dict[str, str], width: float, height: float, m: Metrics | None = None,
+    zoom: float = 1.0,
 ) -> Layout:
-    """`state` as rectangles in a `width` x `height` area."""
+    """`state` as rectangles, for a view of `width` x `height`. `zoom` stretches the time scale (1: the usual one)."""
     m = m or Metrics()
     out = Layout(width, height)
     total = len(state.durations)
@@ -236,100 +245,75 @@ def layout(
     if state.compared and not state.finished:
         out.headline += f"  ·  {state.compared} comparisons"
 
-    # --- the areas
+    # --- the areas: the headline on top and the tray below stay in the view; between them the lanes scroll
     top = m.head_h
     tray_y = height - m.tray_h
     axis_y = tray_y - m.axis_h
-    lanes_bottom = axis_y - 4
+    room = axis_y - 4 + m.lane_gap  # the view's part for lanes, counting the gap that follows the last one
+    bottom_h = height - (axis_y - 4)  # what the tray and the time marks take up below the lanes
     out.tray_y, out.axis_y = tray_y, axis_y
     usable = max(40.0, width - 2 * m.pad)
     seen_span = max((max(o + state.durations.get(n, 0.0) for n, o in g.items()) - min(g.values())) for g in lane_groups) if lane_groups else 0.0
-    out.scale = usable / max(60.0, seen_span)
+    span = max(60.0, seen_span)
+    fit = usable / span  # the scale at which the longest group is all in view
+    base = max(fit, m.min_scale)  # what is usual: that, unless it would make the bars too small to read
+    out.scale = min(max(fit, base * zoom), max(fit, MAX_CONTENT / span))
+    out.zoom = out.scale / base
 
-    # --- lanes: as many as fit, biggest first. To get the first one in: thinner bars, then tighter gaps, then thinner
-    # still; and if even that is not enough, the rows that do not fit are left out (and counted)
+    # --- lanes, biggest first, each as tall as its rows need: the bars are the size that reads well (thicker when there is
+    # room to spare) and what does not fit in the view is scrolled to
     rows_of = [_rows(g, state.durations) for g in lane_groups]
-    room = lanes_bottom + m.lane_gap  # the lanes' area, counting the gap that follows the last one
+    gap = m.bar_gap
 
-    def lane_height(i: int, bar_h: float, gap: float) -> float:
+    def lane_height(i: int, bar_h: float) -> float:
         return m.lane_head_h + (max(rows_of[i].values()) + 1) * (bar_h + gap) + m.lane_gap
 
-    def lanes_that_fit(bh: float, gp: float) -> int:
-        y, n = top, 0
-        for i in range(len(lane_groups)):
-            h = lane_height(i, bh, gp)
-            if n and y + h > room:
-                break
-            y, n = y + h, n + 1
-        return n
-
-    bar_h, gap = m.bar_h, m.bar_gap
-    while lane_groups and top + lane_height(0, bar_h, gap) > room:
-        if bar_h > m.min_bar_h:
-            bar_h -= 1
-        elif gap > 1:
-            gap = 1.0
-        elif bar_h > 3:
-            bar_h -= 1
-        else:
-            break
-    if lane_groups and bar_h == m.bar_h:  # room to spare: thicker bars, as long as every lane that fits still does
-        n0 = lanes_that_fit(bar_h, gap)
-        while bar_h < m.max_bar_h and top + lane_height(0, bar_h + 1, gap) <= room and lanes_that_fit(bar_h + 1, gap) >= n0:
+    bar_h = m.bar_h
+    if lane_groups:
+        while bar_h < m.max_bar_h and top + sum(lane_height(i, bar_h + 1) for i in range(len(lane_groups))) <= room:
             bar_h += 1
     y = top
-    shown = 0
     for i, g in enumerate(lane_groups):
-        h = lane_height(i, bar_h, gap)
-        if shown and y + h > room:
-            break
-        max_rows = max(1, int((room - y - m.lane_gap - m.lane_head_h) // (bar_h + gap)))
+        h = lane_height(i, bar_h)
         lo = min(g.values())
-        span = max(o + state.durations.get(n, 0.0) for n, o in g.items()) - lo
+        length_of_group = max(o + state.durations.get(n, 0.0) for n, o in g.items()) - lo
         chosen = bool(state.chosen and state.chosen & set(g))
-        hidden = sum(1 for n in g if rows_of[i][n] >= max_rows)
         out.lanes.append(Lane(
-            i, y, min(h, room - y) - m.lane_gap,
-            f"Group {i + 1}  ·  {len(g)} clips  ·  {clock(span)}" + (f"  ·  {hidden} not shown" if hidden else ""),
-            len(g), span, chosen=chosen, dim=bool(state.chosen) and not chosen,
+            i, y, h - m.lane_gap, f"Group {i + 1}  ·  {len(g)} clips  ·  {clock(length_of_group)}",
+            len(g), length_of_group, chosen=chosen, dim=bool(state.chosen) and not chosen,
         ))
-        out.hidden_bars += hidden
         for name, start in g.items():
-            row = rows_of[i][name]
-            if row >= max_rows:
-                continue
             length = state.durations.get(name, 0.0)
             w = max(3.0, length * out.scale)
             label = labels.get(name) or PurePath(name).stem
             out.bars.append(Bar(
-                name, m.pad + (start - lo) * out.scale, y + m.lane_head_h + row * (bar_h + gap), w, bar_h, i,
+                name, m.pad + (start - lo) * out.scale, y + m.lane_head_h + rows_of[i][name] * (bar_h + gap), w, bar_h, i,
                 _fit(label, w, m), title_of(name), start - lo, length, chosen=bool(state.chosen) and name in state.chosen,
             ))
         y += h
-        shown += 1
-    out.hidden_lanes = len(lane_groups) - shown
-    out.ticks = _ticks(out.scale, usable / out.scale if out.scale else 0, m, m.pad) if lane_groups else []
+    out.lanes_bottom = y - m.lane_gap if lane_groups else top
 
-    # --- the tray: the clip being sorted, then those waiting, then those that matched nothing (yet)
-    def place_chips(names: list[str], kind: str, row_y: float, x0: float, room: float) -> None:
-        per_row = max(1, int(room // (m.chip + m.chip_gap)))
-        fit = len(names) if len(names) <= per_row else max(0, per_row - 3)  # leave room for the '+N'
-        for k, name in enumerate(names[:fit]):
+    # --- the tray: the clip being sorted, then those waiting, then those that matched nothing (yet). Every clip has its
+    # chip, in a row that goes on as far as it must
+    def place_chips(names: list[str], kind: str, row_y: float, x0: float) -> float:
+        for k, name in enumerate(names):
             out.chips.append(Chip(name, x0 + k * (m.chip + m.chip_gap), row_y, m.chip, kind, title_of(name)))
-        if len(names) > fit:
-            out.hidden_chips[kind] = len(names) - fit
+        return x0 + len(names) * (m.chip + m.chip_gap)
 
     label_w = m.label_w
     row1, row2 = tray_y + 6, tray_y + 6 + m.chip + 16
     if state.current and not current_placed:
         out.chips.append(Chip(state.current, m.pad + label_w, row1, m.chip * 1.5, "current", title_of(state.current)))
     waiting_x = m.pad + label_w + (m.chip * 1.5 + m.chip_gap * 2 if state.current and not current_placed else 0)
-    place_chips(list(state.pending), "waiting", row1, waiting_x, width - m.pad - waiting_x - 40)
-    place_chips(unmatched, "unmatched", row2, m.pad + label_w, width - 2 * m.pad - label_w - 40)
+    tray_end = max(place_chips(list(state.pending), "waiting", row1, waiting_x), place_chips(unmatched, "unmatched", row2, m.pad + label_w))
     if state.current in unmatched:  # a clip getting its second look: it is in the tray, and it is the one at work
         for chip in out.chips:
             if chip.name == state.current:
                 chip.kind = "current"
+
+    out.content_w = max(width, (2 * m.pad + seen_span * out.scale) if lane_groups else 0.0, tray_end + m.pad)
+    out.content_h = max(height, out.lanes_bottom + bottom_h)
+    out.ticks = _ticks(out.scale, (out.content_w - 2 * m.pad) / out.scale if out.scale else 0, m, m.pad) if lane_groups else []
 
     # --- the comparison going on
     if state.compare:
@@ -348,11 +332,11 @@ def chip_lookup(lay: Layout) -> dict[str, Chip]:
 
 
 def fit_check(lay: Layout) -> list[str]:
-    """Problems with a layout (for tests): bars that stick out, or overlap in one row of one lane."""
+    """Problems with a layout (for tests): bars that stick out of the content, or overlap in one row of one lane."""
     problems = []
     by_row: dict[tuple[int, float], list[Bar]] = {}
     for b in lay.bars:
-        if b.x < -0.01 or b.x + b.w > lay.width + 0.01 or b.y + b.h > lay.axis_y + 0.01:
+        if b.x < -0.01 or b.x + b.w > lay.content_w + 0.01 or b.y + b.h > lay.content_h + 0.01:
             problems.append(f"{b.name} sticks out")
         by_row.setdefault((b.lane, round(b.y, 3)), []).append(b)
     for bars in by_row.values():

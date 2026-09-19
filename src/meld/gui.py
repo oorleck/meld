@@ -18,7 +18,7 @@ from pathlib import Path
 
 from . import cache, ytdlp
 from .audiofuse import fuse_audio
-from .matchcanvas import MatchCanvas, Theme
+from .matchcanvas import MatchPanel, Theme
 from .fetch import BLOCKED_MESSAGE, LOGIN_BROWSERS, expand_queries, fetch, installed_browsers, is_blocked
 from .naming import concert_name, shared_words, trim_connectors, unique_stem
 from .project import _PARTIAL, Project, slugify
@@ -476,6 +476,12 @@ def apply_theme(style, px) -> None:
         lightcolor=SURFACE3, darkcolor=SURFACE3,
     )
     style.map("Vertical.TScrollbar", background=[("active", BORDER)])
+    for orient in ("Vertical", "Horizontal"):  # those of the window of the matching: on its own background
+        style.configure(
+            f"Match.{orient}.TScrollbar", background=SURFACE3, troughcolor=BG, bordercolor=BG, arrowcolor=MUTED,
+            lightcolor=SURFACE3, darkcolor=SURFACE3,
+        )
+        style.map(f"Match.{orient}.TScrollbar", background=[("active", BORDER)])
 
 
 def draw_logo(canvas, size: int) -> None:
@@ -835,7 +841,7 @@ def main(hook=None) -> None:
                     win.iconbitmap(str(icon))
                 except tk.TclError:
                     pass
-            canvas = MatchCanvas(win, match_theme, scale, height=px(420))
+            canvas = MatchPanel(win, match_theme, scale, height=px(420), bar_style="Match")
             canvas.pack(fill="both", expand=True, padx=px(10), pady=px(10))
             win.minsize(px(640), px(320))
             win.protocol("WM_DELETE_WINDOW", lambda: show_matching(False, by_user=True))
