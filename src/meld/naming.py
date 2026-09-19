@@ -44,6 +44,12 @@ def _pretty(word: str) -> str:
     return word.capitalize() if (word.isupper() and len(word) > 4) or word.islower() else word
 
 
+def is_filler(word: str) -> bool:
+    """Whether a word of a title says nothing about which video it is: live, official, hd, at, of ..."""
+    k = _key(word)
+    return k in _NOISE or k in _CONNECTORS or not k
+
+
 def content_keys(title: str) -> set[str]:
     """The words of a title that can say which concert or song it is: no noise words, connectors or numbers."""
     return {

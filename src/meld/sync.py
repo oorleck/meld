@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 from scipy.fft import irfft, next_fast_len, rfft
 
+from .matchview import MatchState
 from .media import audio_cache_path, load_audio, probe
 from .pool import Comparer, default_workers
 from .project import Project
@@ -202,7 +203,7 @@ def _pair(a: str, b: str) -> tuple[str, str]:
 
 
 def _align_groups(
-    audio: dict, min_z: float, min_overlap: float, max_compare: int, log, comparer: Comparer,
+    audio: dict, min_z: float, min_overlap: float, max_compare: int, log, comparer: Comparer, on_state=None,
 ) -> tuple[_Groups, dict]:
     """Sort clips into groups that line up with each other, all growing at the same time.
 
@@ -233,6 +234,9 @@ def _align_groups(
     done = phase1_done = 0
     processed: list[str] = []
     phase = 1
+    lengths = {n: len(audio[n]) / AR for n in order}  # seconds, for `on_state`
+    current: str | None = None  # the clip being sorted now
+    pending_from = 0  # in the first sweep, order[pending_from:] has not been looked at yet
     retry: list[str] = []  # phase 2: the clips to get another look
     retried = looking = 0
     second_units = 0.0  # phase 2: what this pass is expected to cost, in samples of the two clips compared
@@ -262,9 +266,19 @@ def _align_groups(
     def progress() -> str:
         return f"{len(processed)}/{total} placed" if phase == 1 else f"{retried}/{looking} placed (a second look)"
 
+    def emit(compare: tuple[str, str, float | None] | None = None) -> None:
+        """Tell whoever is watching (the window) how things stand: a snapshot, so they need not follow every step."""
+        if on_state is not None:
+            on_state(MatchState(
+                durations=lengths, groups=tuple(dict(m) for m in groups.members.values()),
+                pending=tuple(order[pending_from:]) if phase == 1 else (), current=current, compare=compare,
+                phase=phase, compared=done, min_z=min_z,
+            ))
+
     def compare(u: str, p: str) -> None:
         nonlocal spent, samples, done, phase1_done
         a, b = _pair(u, p)
+        emit((u, p, None))  # this pair is being worked out (or waited for, if a worker is already on it)
         t = time.perf_counter()
         tried[(a, b)] = comparer.result(a, b)  # waits for it if it is being computed in the background
         if done:  # the first comparison also pays for starting the workers and for cold caches: not part of the rate
@@ -278,6 +292,7 @@ def _align_groups(
             f"  {u} vs {p}: z={tried[(a, b)][1]:.1f} | {progress()}, {done} comparisons, "
             f"{format_duration(time.perf_counter() - started)} elapsed{time_left()}"
         )
+        emit((u, p, tried[(a, b)][1]))
 
     def after(u: str, p: str) -> tuple[float, float]:
         """(lag, z) of the pair, with lag = how many seconds later u starts than p."""
@@ -421,13 +436,17 @@ def _align_groups(
                 groups.merge(main, gid, shift)
                 log(f"  {u} links two groups (via {q}): they are one now")
 
+    emit()
     for i, u in enumerate(order):
+        current, pending_from = u, i + 1
+        emit()
         found = attach(u, tuple(order[i + 1: i + 1 + AHEAD_CLIPS])) if groups.members else {}
         if found:
             place(u, found)
         else:
             groups.seed(u)
         processed.append(u)
+        emit()
 
     phase = 2
     for _ in range(LOOSE_PASSES):
@@ -438,13 +457,18 @@ def _align_groups(
         second_units, pass_start = second_look_units(retry), (spent, samples, done)
         for i, u in enumerate(retry):
             if groups.loose(u):  # not already taken into a group by a clip that looked before it
+                current = u
+                emit()
                 found = attach(u, tuple(retry[i + 1: i + 1 + AHEAD_CLIPS]))
                 if found:
                     place(u, found)
                     merged = True
+                emit()
             retried += 1
         if not merged:
             break
+    current = None
+    emit()
     log(f"Matching took {format_duration(time.perf_counter() - started)} ({done} comparisons).")
     return groups, best_z
 
@@ -516,7 +540,7 @@ def _align_single(audio: dict, min_z: float, min_overlap: float, max_compare: in
 
 def sync_project(
     project: Project, min_z: float = 10.0, min_overlap: float = 5.0, max_compare: int = 25, log=print,
-    clusters: bool = True, cluster: int = 1, choose=None, workers: int | None = None,
+    clusters: bool = True, cluster: int = 1, choose=None, workers: int | None = None, on_state=None,
 ) -> Timeline:
     """Line all the clips up. With `clusters` (the default) clips are sorted into groups that line up with each other,
     all at once, so it does not matter which clip is the longest or which concert it is from; the biggest group is
@@ -524,7 +548,8 @@ def sync_project(
     are several worth choosing between (each a Timeline); it returns an index into that list, or None for the biggest.
     Without `clusters`, one group is grown from the longest clip and everything that does not join it is rejected.
     `workers` is how many comparisons are run at once, in separate processes: None leaves it to the number of cores and
-    the size of the job, 1 is one at a time. The result does not depend on it."""
+    the size of the job, 1 is one at a time. The result does not depend on it. `on_state(MatchState)`, if given, is
+    called as the matching goes on (from the thread that runs it) to show it as it happens; see matchview.py."""
     files = project.clip_files()
     if not files:
         raise SystemExit(f"No media files in {project.clips_dir}")
@@ -579,8 +604,16 @@ def sync_project(
         )
         if comparer.parallel:
             log(f"Comparing up to {comparer.workers} clips at a time.")
+        last: list[MatchState] = []
+
+        def watch(state: MatchState) -> None:
+            last[:] = [state]
+            on_state(state)
+
         try:
-            groups, best_z = _align_groups(audio, min_z, min_overlap, max_compare, log, comparer)
+            groups, best_z = _align_groups(
+                audio, min_z, min_overlap, max_compare, log, comparer, watch if on_state is not None else None,
+            )
         finally:
             comparer.close()
         ranked = sorted(
@@ -598,6 +631,10 @@ def sync_project(
                 raise SystemExit(f"Only {len(made)} group(s) of clips line up; there is no group {cluster}.")
             pick = cluster - 1
         clips = made[pick] if made else []
+        if on_state is not None and last:  # over: which group is used
+            on_state(replace(
+                last[0], current=None, compare=None, pending=(), finished=True, chosen=frozenset(c.file for c in clips),
+            ))
         for i, group in enumerate(made):
             if i == pick:
                 continue

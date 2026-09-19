@@ -18,6 +18,7 @@ from pathlib import Path
 
 from . import ytdlp
 from .audiofuse import fuse_audio
+from .matchcanvas import MatchCanvas, Theme
 from .fetch import BLOCKED_MESSAGE, LOGIN_BROWSERS, expand_queries, fetch, installed_browsers, is_blocked
 from .naming import concert_name, shared_words, trim_connectors, unique_stem
 from .project import _PARTIAL, Project, slugify
@@ -125,11 +126,21 @@ def describe_groups(project: Project, groups: list) -> list[Option]:
     return options
 
 
-def run_pipeline(s: Settings, log=print, stage=lambda i, name: None, choose_group=None) -> dict:
+def load_titles(project: Project) -> dict[str, str]:
+    """YouTube video id -> title, for the clips downloaded into `project`."""
+    try:
+        sources = json.loads(project.sources_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {vid: info.get("title") or "" for vid, info in sources.items()}
+
+
+def run_pipeline(s: Settings, log=print, stage=lambda i, name: None, choose_group=None, on_match=None) -> dict:
     """Preview, sort, download, line up, mix and cut. The video and the sound go into `s.folder`, named after the concert.
 
     Candidates are first downloaded as small audio-only previews and sorted into groups by their sound; if there are
     several groups worth choosing between, `choose_group(options)` is asked which (it returns one of the options).
+    `on_match(state, titles)`, if given, is called as they are sorted, to show it happening (see matchview.py).
     Only the videos of that group are then downloaded in full. Returns
     {"video", "audio", "folder", "minutes", "used", "skipped"}."""
     project = Project(s.project_dir)
@@ -153,8 +164,17 @@ def run_pipeline(s: Settings, log=print, stage=lambda i, name: None, choose_grou
         answer = choose_group(options)
         return options.index(answer) if answer is not None else None
 
+    titles: dict[str, str] = {}
+
+    def watch(state) -> None:
+        if not titles:
+            titles.update(load_titles(preview))
+        on_match(state, titles)
+
     stage(1, STAGES[1])
-    sorted_tl = sync_project(preview, log=log, choose=pick_group if choose_group else None)
+    sorted_tl = sync_project(
+        preview, log=log, choose=pick_group if choose_group else None, **({"on_state": watch} if on_match else {}),
+    )
     if not sorted_tl.clips:
         raise UserError("None of the videos could be lined up with each other, so there is nothing to combine.")
     chosen = sorted(sorted_tl.clips, key=lambda c: -c.duration)[: s.clips]  # the longest, if the group is bigger
@@ -658,31 +678,104 @@ def main(hook=None) -> None:
 
     footer = ttk.Frame(frm)
     footer.grid(row=11, column=0, sticky="ew", pady=(px(12), 0))
-    footer.columnconfigure(1, weight=1)
+    footer.columnconfigure(2, weight=1)
     # padding=0 on the outer edges so the link text lines up with the content above
     details_btn = ttk.Button(footer, style="Link.TButton", cursor="hand2", text="Show details", padding=(0, px(4)))
     details_btn.grid(row=0, column=0, sticky="w")
+    match_btn = ttk.Button(footer, style="Link.TButton", cursor="hand2", text="Show matching")
+    match_btn.grid(row=0, column=1)
     login_btn = ttk.Button(footer, style="Link.TButton", cursor="hand2", text="YouTube login")
-    login_btn.grid(row=0, column=2)
+    login_btn.grid(row=0, column=3)
     update_btn = ttk.Button(footer, style="Link.TButton", cursor="hand2", text="Update the YouTube downloader")
-    update_btn.grid(row=0, column=3)
+    update_btn.grid(row=0, column=4)
     about_btn = ttk.Button(footer, style="Link.TButton", cursor="hand2", text="About", padding=(px(8), px(4), 0, px(4)))
-    about_btn.grid(row=0, column=4)
+    about_btn.grid(row=0, column=5)
+
+    def keep_on_screen() -> None:
+        """The window just grew: slide it up if it now runs off the bottom of the screen."""
+        root.update_idletasks()
+        overflow = root.winfo_y() + root.winfo_reqheight() - (root.winfo_screenheight() - px(60))
+        if overflow > 0:
+            root.geometry(f"+{root.winfo_x()}+{max(0, root.winfo_y() - overflow)}")
+
+    # -- the matching, drawn as it happens: a window of its own beside this one, made the first time it is wanted
+    match_theme = Theme(
+        bg=BG, surface=SURFACE, surface2=SURFACE2, border=BORDER, text=TEXT, muted=MUTED, accent=ACCENT,
+        good="#5ee0a0", bad=CORAL, on_bar="#15161f",
+        palette=("#ffd23f", "#ff9f45", "#ff785a", "#f76ec0", "#a78bfa", "#6ec6ff", "#4fd1c5", "#a3e26a"),
+    )
+    view = {"win": None, "canvas": None, "last": None}  # the window, its canvas, and the newest (state, titles)
+
+    def place_matching(win) -> None:
+        """Put the matching window next to this one, as wide as is useful. If the screen has no room beside this
+        window, slide this one to the left edge and let the other overlap only its right part, so that the buttons
+        and the steps on its left stay visible."""
+        root.update_idletasks()
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        x, y, w, h = root.winfo_x(), root.winfo_y(), root.winfo_width(), root.winfo_height()
+        gap, want = px(14), px(900)
+        if x + w + gap + want > sw and x > gap:  # not enough room on the right: slide this window to the left edge
+            x = gap
+            root.geometry(f"+{x}+{y}")
+        right = x + w + gap
+        overlap = min(max(0, right + want - (sw - gap)), int(w * 0.6))  # never cover more than 60% of it
+        left = right - overlap
+        width = max(px(560), min(sw - gap - left, px(1700)))
+        height = min(max(h, px(560)), sh - px(80))
+        win.geometry(f"{width}x{height}+{left}+{max(0, min(y, sh - height - px(70)))}")
+
+    def ensure_matching():
+        if view["win"] is None:
+            win = tk.Toplevel(root)
+            win.withdraw()
+            win.title("Meld - the matching")
+            win.configure(background=BG)
+            if icon:
+                try:
+                    win.iconbitmap(str(icon))
+                except tk.TclError:
+                    pass
+            canvas = MatchCanvas(win, match_theme, scale, height=px(420))
+            canvas.pack(fill="both", expand=True, padx=px(10), pady=px(10))
+            win.minsize(px(640), px(320))
+            win.protocol("WM_DELETE_WINDOW", lambda: show_matching(False, by_user=True))
+            place_matching(win)
+            style_titlebar(win)
+            view["win"], view["canvas"] = win, canvas
+        return view["canvas"]
+
+    def matching_visible() -> bool:
+        return view["win"] is not None and str(view["win"].state()) == "normal"
+
+    def show_matching(show: bool, by_user: bool = False) -> None:
+        """Show or hide the window of the matching. It opens by itself when a run starts sorting, unless the person
+        has closed it (`by_user`) since the program started."""
+        if by_user:
+            state["match_closed_by_user"] = not show
+        if show == matching_visible():
+            return
+        if show:
+            canvas = ensure_matching()
+            view["win"].deiconify()
+            if view["last"]:
+                canvas.set_state(*view["last"])
+            match_btn.configure(text="Hide matching")
+        else:
+            view["win"].withdraw()
+            match_btn.configure(text="Show matching")
 
     def toggle_details() -> None:
         show_details.set(not show_details.get())
         if show_details.get():
             log_frame.grid(row=10, column=0, sticky="nsew", pady=(px(14), 0))
             details_btn.configure(text="Hide details")
-            root.update_idletasks()  # the window just grew: slide it up if it now runs off the bottom of the screen
-            overflow = root.winfo_y() + root.winfo_reqheight() - (root.winfo_screenheight() - px(60))
-            if overflow > 0:
-                root.geometry(f"+{root.winfo_x()}+{max(0, root.winfo_y() - overflow)}")
+            keep_on_screen()
         else:
             log_frame.grid_remove()
             details_btn.configure(text="Show details")
 
     details_btn.configure(command=toggle_details)
+    match_btn.configure(command=lambda: show_matching(not matching_visible(), by_user=True))
 
     def add_log(line: str) -> None:
         log_text.configure(state="normal")
@@ -727,9 +820,12 @@ def main(hook=None) -> None:
                     raise Cancelled()
                 return answer
 
+        def on_match(match_state, titles) -> None:
+            q.put(("match", match_state, titles))
+
         result = None
         try:
-            result = run_pipeline(s, log, stage, choose_group)
+            result = run_pipeline(s, log, stage, choose_group, on_match)
         except Cancelled:
             q.put(("cancelled",))
         except BaseException as e:  # noqa: BLE001 - everything must reach the user
@@ -771,6 +867,9 @@ def main(hook=None) -> None:
         state["result"] = None
         result_label.configure(text="")
         result_card.grid_remove()
+        view["last"] = None
+        if view["canvas"] is not None:
+            view["canvas"].set_state(None)
         panel.grid()
         set_step(-1)
         step_var.set("Starting...")
@@ -939,11 +1038,14 @@ def main(hook=None) -> None:
         show_modal(win)
 
     def poll() -> None:
+        newest_match = None  # comparisons can come faster than the screen is drawn: only the latest is worth showing
         try:
             while True:
                 msg = q.get_nowait()
                 kind = msg[0]
-                if kind == "choose_group":
+                if kind == "match":
+                    newest_match = msg
+                elif kind == "choose_group":
                     ask_group(msg[1])
                 elif kind == "stage":
                     step_var.set(f"Step {msg[1] + 1} of {len(STAGES)}: {msg[2]}")
@@ -986,6 +1088,12 @@ def main(hook=None) -> None:
                     messagebox.showinfo(APP_NAME, msg[1])
         except queue.Empty:
             pass
+        if newest_match is not None:
+            view["last"] = (newest_match[1], newest_match[2])
+            if not state.get("match_closed_by_user"):
+                show_matching(True)
+            if matching_visible():
+                view["canvas"].set_state(*view["last"])
         root.after(100, poll)
 
     def on_close() -> None:
@@ -1056,7 +1164,7 @@ def main(hook=None) -> None:
     root.after(100, poll)
     if hook:
         widgets = {
-            "query": query_var, "folder": folder_var, "clips": clips_var, "quality": quality_var, "login": login_var,
+            "query": query_var, "folder": folder_var, "clips": clips_var, "quality": quality_var, "login": login_var, "match_btn": match_btn, "match_view": view,
             "start": start_btn, "step": step_var, "detail": detail_var, "result": result_label, "play": play_btn,
             "queue": q, "keep": keep_var,
         }

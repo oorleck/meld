@@ -368,3 +368,37 @@ def test_a_login_that_cannot_be_read_is_shown_in_plain_words(tmp_path, monkeypat
     with pytest.raises(SystemExit) as e:
         run_pipeline(Settings("x", tmp_path, login="chrome"), log=lambda *_: None)
     assert friendly_error(e.value) == message
+
+
+# ---- the live view of the matching
+
+
+def test_titles_are_read_from_the_downloads_record_by_video_id(tmp_path):
+    from meld.project import Project
+
+    project = Project(tmp_path)
+    assert gui.load_titles(project) == {}  # nothing downloaded yet
+    project.sources_path.write_text(json.dumps({"abc": {"title": "Band - Song"}, "def": {"title": None}, "ghi": {}}), encoding="utf-8")
+    assert gui.load_titles(project) == {"abc": "Band - Song", "def": "", "ghi": ""}
+
+
+def test_the_pipeline_shows_the_matching_as_it_happens_and_gives_the_titles(tmp_path, monkeypatch):
+    yt = FakeYouTube(tmp_path / "youtube", titles={f"{n}{i}": f"Band {n.upper()} - Song {i}" for n in "ab" for i in (1, 2, 3)})
+    _two_concerts(yt)
+    monkeypatch.setattr(gui, "fetch", yt)
+    seen = []
+    watched = run_pipeline(
+        Settings("watched 2024", tmp_path / "w", clips=20, quality=480), log=lambda *_: None,
+        choose_group=lambda options: options[0], on_match=lambda state, titles: seen.append((state, dict(titles))),
+    )
+    assert len(seen) > 10  # many steps, not just the end
+    first, last = seen[0][0], seen[-1][0]
+    assert first.groups == () and len(first.pending) == 6  # every clip waiting
+    assert last.finished and last.chosen and len(last.groups) == 2  # two concerts, one of them used
+    assert all(titles["a1"] == "Band A - Song 1" for _, titles in seen)  # the titles came with it, by video id
+    assert {Path(n).stem for n in last.durations} == {"a1", "a2", "a3", "b1", "b2", "b3"}
+
+    plain = run_pipeline(  # and watching does not change what is made
+        Settings("watched 2024", tmp_path / "p", clips=20, quality=480), log=lambda *_: None, choose_group=lambda options: options[0],
+    )
+    assert (watched["used"], watched["skipped"]) == (plain["used"], plain["skipped"])

@@ -52,6 +52,15 @@ optional desktop one) and shows a personal-use notice. An installed copy can be 
 - **Only those two files are kept.** When a run finishes, the downloaded videos and all working files are deleted
   (only Meld's own; anything else in the folder stays). Turn on **Keep the downloaded videos** to keep them in
   `<folder>\<search>\`. A run that is cancelled or fails always keeps them, so trying again does not download them again.
+- **Watch the matching.** When the videos start being sorted by their sound, a second window, *Meld - the matching*,
+  opens beside the main one (on a small screen the main window slides to the left edge and the new one overlaps only
+  its right part, so Start, Cancel and the steps stay visible) and shows it happening. Each group of videos that line
+  up is a timeline with a bar per video, placed where it falls in the group and labelled with its title (without the
+  words most titles share, such as the band and the year). All timelines share one time scale, so a bigger group
+  looks bigger; videos playing at the same time are stacked. The video being sorted waits in a tray at the bottom
+  and a dotted line runs from it to the one it is being compared with, with the score it got; a match slides the bar
+  into its group, and a video that links two groups makes them one. When sorting is over the group that is used is
+  outlined. Hover a bar for its whole title. Close the window any time; **Show matching** in the footer brings it back.
 - **YouTube login (optional).** When YouTube answers "Sign in to confirm you're not a bot", downloads fail whatever
   the video. The **YouTube login** link at the bottom of the window lets Meld use the login already saved in one of
   your browsers (Firefox, Edge, Chrome or Brave, whichever are installed): sign in to YouTube in that browser, choose
